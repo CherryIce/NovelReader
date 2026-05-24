@@ -174,7 +174,8 @@ class BookRepository: BookRepositoryProtocol {
     func updateReadingProgress(
         bookId: UUID,
         chapterIndex: Int,
-        contentOffset: Int
+        contentOffset: Int,
+        readingStatus: ReadingStatus
     ) -> AnyPublisher<Void, Error> {
         Future { promise in
             self.context.perform {
@@ -186,7 +187,7 @@ class BookRepository: BookRepositoryProtocol {
                         entity.lastReadChapterIndex = Int32(chapterIndex)
                         entity.lastReadContentOffset = Int32(contentOffset)
                         entity.lastReadAt = Date()
-                        entity.readingStatus = ReadingStatus.reading.rawValue
+                        entity.readingStatus = readingStatus.rawValue
                         try self.context.save()
                         promise(.success(()))
                     } else {

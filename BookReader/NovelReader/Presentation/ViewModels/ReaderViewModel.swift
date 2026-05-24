@@ -701,11 +701,16 @@ class ReaderViewModel: ObservableObject {
     private func saveProgress() {
         guard let page = currentPage else { return }
         
-        // 保存章节索引和精确的 contentOffset
+        // 判断是否已读完（当前页是最后一页且是最后一章）
+        let isCompleted = currentPageIndex == pages.count - 1 && currentChapterIndex == chapters.count - 1
+        let newStatus: ReadingStatus = isCompleted ? .completed : .reading
+        
+        // 保存章节索引、contentOffset 和阅读状态
         bookRepository.updateReadingProgress(
             bookId: book.id,
             chapterIndex: currentChapterIndex,
-            contentOffset: page.contentOffset
+            contentOffset: page.contentOffset,
+            readingStatus: newStatus
         )
         .sink(receiveCompletion: { _ in }, receiveValue: { _ in })
         .store(in: &cancellables)

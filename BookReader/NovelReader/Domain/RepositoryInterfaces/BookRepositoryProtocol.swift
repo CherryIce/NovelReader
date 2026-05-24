@@ -31,7 +31,8 @@ protocol BookRepositoryProtocol {
     func updateReadingProgress(
         bookId: UUID,
         chapterIndex: Int,
-        contentOffset: Int
+        contentOffset: Int,
+        readingStatus: ReadingStatus
     ) -> AnyPublisher<Void, Error>
     
     /// 切换收藏状态

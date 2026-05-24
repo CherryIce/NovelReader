@@ -1,33 +1,9 @@
 import Foundation
 import Combine
 
-/// 书架筛选条件
-enum LibraryFilter: String, CaseIterable, Identifiable {
-    case all = "all"
-    case reading = "reading"
-    case completed = "completed"
-    case favorite = "favorite"
-    
-    var id: String { rawValue }
-    
-    var displayName: String {
-        switch self {
-        case .all: return "全部"
-        case .reading: return "在读"
-        case .completed: return "已读完"
-        case .favorite: return "收藏"
-        }
-    }
-}
-
 /// 书架视图模型
 class LibraryViewModel: ObservableObject {
     @Published var books: [Book] = []
-    @Published var currentFilter: LibraryFilter = .reading {
-        didSet {
-            loadBooks()
-        }
-    }
     @Published var error: BookError?
     @Published var selectedBook: Book?
     
@@ -48,22 +24,7 @@ class LibraryViewModel: ObservableObject {
     
     /// 加载书籍列表
     func loadBooks() {
-        let publisher: AnyPublisher<[Book], Error>
-        
-        switch currentFilter {
-        case .all:
-            publisher = bookRepository.getAllBooks()
-        case .reading:
-            publisher = bookRepository.getRecentlyReadBooks(limit: 50)
-        case .completed:
-            publisher = bookRepository.getAllBooks()
-                .map { $0.filter { $0.readingStatus == .completed } }
-                .eraseToAnyPublisher()
-        case .favorite:
-            publisher = bookRepository.getFavoriteBooks()
-        }
-        
-        publisher
+        bookRepository.getAllBooks()
             .receive(on: DispatchQueue.main)
             .sink(
                 receiveCompletion: { [weak self] completion in
@@ -76,11 +37,6 @@ class LibraryViewModel: ObservableObject {
                 }
             )
             .store(in: &cancellables)
-    }
-    
-    /// 设置筛选条件
-    func setFilter(_ filter: LibraryFilter) {
-        currentFilter = filter
     }
     
     /// 选择书籍

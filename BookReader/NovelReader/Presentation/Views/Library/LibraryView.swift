@@ -18,7 +18,7 @@ struct LibraryView: View {
             .navigationBarTitle("书架", displayMode: .automatic)
             .navigationBarItems(trailing: addButton)
             .sheet(isPresented: $showingDocumentPicker) {
-                DocumentPicker { url in
+                DocumentPicker(isPresented: $showingDocumentPicker) { url in
                     viewModel.importBook(from: url)
                 }
             }
@@ -47,26 +47,8 @@ struct LibraryView: View {
     
     private var contentLayer: some View {
         VStack(spacing: 0) {
-            filterBar
             bookGrid
         }
-    }
-    
-    private var filterBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 12) {
-                ForEach(LibraryFilter.allCases) { filter in
-                    FilterButton(
-                        title: filter.displayName,
-                        isSelected: viewModel.currentFilter == filter
-                    ) {
-                        viewModel.setFilter(filter)
-                    }
-                }
-            }
-            .padding(.horizontal)
-        }
-        .padding(.vertical, 8)
     }
     
     private var bookGrid: some View {
@@ -265,34 +247,15 @@ struct BookGridItem: View {
 
 // MARK: - 子视图
 
-struct FilterButton: View {
-    let title: String
-    let isSelected: Bool
-    let action: () -> Void
-    
-    var body: some View {
-        Button(action: action) {
-            Text(title)
-                .font(.subheadline)
-                .fontWeight(isSelected ? .semibold : .regular)
-                .foregroundColor(isSelected ? .white : .primary)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .background(isSelected ? Color.blue : Color(.systemGray6))
-                .cornerRadius(16)
-        }
-    }
-}
-
 struct BookCell: View {
     let book: Book
     
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             // 封面
-            ZStack {
+            ZStack(alignment: .center) {
                 RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(.systemGray5))
+                    .fill(Color.blue.opacity(0.15))
                     .aspectRatio(3/4, contentMode: .fit)
                 
                 if let coverPath = book.coverImagePath,
@@ -301,28 +264,34 @@ struct BookCell: View {
                         .resizable()
                         .scaledToFill()
                         .cornerRadius(8)
-                } else {
-                    VStack {
-                        Image(systemName: "book.fill")
-                            .font(.largeTitle)
-                            .foregroundColor(.gray)
-                        Text(book.title.prefix(2))
-                            .font(.caption)
-                            .foregroundColor(.gray)
-                    }
+                }else {
+                    Text(book.title)
+                        .font(.caption)
+                        .fontWeight(.medium)
+                        .lineLimit(2)
+                        .foregroundColor(.primary)
+                        .multilineTextAlignment(.center) // 建议：多行文本内部也居中
+                        .padding(8) // 建议：增加内边距，防止文字贴边
+                }
+                
+                // 已读完标识
+                if book.readingStatus == .completed {
+                    Text("已读完")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(Color.green)
+                        .cornerRadius(4)
+                        .padding(6)
+                    // 2. 核心修改：通过 frame 将该标签单独推到左上角
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 }
             }
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
                     .stroke(Color.gray.opacity(0.2), lineWidth: 1)
             )
-            
-            // 书名
-            Text(book.title)
-                .font(.caption)
-                .fontWeight(.medium)
-                .lineLimit(1)
-                .foregroundColor(.primary)
         }
     }
 }
@@ -452,8 +421,9 @@ struct FullScreenCover: UIViewControllerRepresentable {
 // MARK: - Document Picker
 
 struct DocumentPicker: UIViewControllerRepresentable {
+    @Binding var isPresented: Bool
     let onPick: (URL) -> Void
-    
+
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
         let picker = UIDocumentPickerViewController(
             documentTypes: [kUTTypeText as String],
@@ -463,23 +433,34 @@ struct DocumentPicker: UIViewControllerRepresentable {
         picker.allowsMultipleSelection = false
         return picker
     }
-    
+
     func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
-    
+
     func makeCoordinator() -> Coordinator {
-        Coordinator(onPick: onPick)
+        Coordinator(isPresented: $isPresented, onPick: onPick)
     }
-    
+
     class Coordinator: NSObject, UIDocumentPickerDelegate {
+        @Binding var isPresented: Bool
         let onPick: (URL) -> Void
-        
-        init(onPick: @escaping (URL) -> Void) {
+
+        init(isPresented: Binding<Bool>, onPick: @escaping (URL) -> Void) {
+            self._isPresented = isPresented
             self.onPick = onPick
         }
-        
+
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
             guard let url = urls.first else { return }
             onPick(url)
+            DispatchQueue.main.async {
+                self.isPresented = false
+            }
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            DispatchQueue.main.async {
+                self.isPresented = false
+            }
         }
     }
 }
