@@ -47,16 +47,9 @@ struct LibraryView: View {
     
     private var contentLayer: some View {
         VStack(spacing: 0) {
-            searchBar
             filterBar
             bookGrid
         }
-    }
-    
-    private var searchBar: some View {
-        SearchBar(text: $viewModel.searchQuery)
-            .padding(.horizontal)
-            .padding(.vertical, 8)
     }
     
     private var filterBar: some View {
@@ -271,30 +264,6 @@ struct BookGridItem: View {
 }
 
 // MARK: - 子视图
-
-struct SearchBar: View {
-    @Binding var text: String
-    
-    var body: some View {
-        HStack {
-            Image(systemName: "magnifyingglass")
-                .foregroundColor(.gray)
-            
-            TextField("搜索书籍", text: $text)
-                .textFieldStyle(PlainTextFieldStyle())
-            
-            if !text.isEmpty {
-                Button(action: { text = "" }) {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundColor(.gray)
-                }
-            }
-        }
-        .padding(10)
-        .background(Color(.systemGray6))
-        .cornerRadius(10)
-    }
-}
 
 struct FilterButton: View {
     let title: String

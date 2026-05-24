@@ -11,14 +11,6 @@ struct ContentView: View {
                     }
                 }
             
-            Text("搜索")
-                .tabItem {
-                    HStack {
-                        Image(systemName: "magnifyingglass")
-                        Text("搜索")
-                    }
-                }
-            
             Text("设置")
                 .tabItem {
                     HStack {

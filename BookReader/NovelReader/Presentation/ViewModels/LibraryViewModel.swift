@@ -23,11 +23,6 @@ enum LibraryFilter: String, CaseIterable, Identifiable {
 /// 书架视图模型
 class LibraryViewModel: ObservableObject {
     @Published var books: [Book] = []
-    @Published var searchQuery: String = "" {
-        didSet {
-            performSearch()
-        }
-    }
     @Published var currentFilter: LibraryFilter = .reading {
         didSet {
             loadBooks()
@@ -76,24 +71,6 @@ class LibraryViewModel: ObservableObject {
                         self?.error = error as? BookError ?? .parseFailed
                     }
                 },
-                receiveValue: { [weak self] books in
-                    self?.books = books
-                }
-            )
-            .store(in: &cancellables)
-    }
-    
-    /// 搜索书籍
-    private func performSearch() {
-        guard !searchQuery.isEmpty else {
-            loadBooks()
-            return
-        }
-        
-        bookRepository.searchBooks(query: searchQuery)
-            .receive(on: DispatchQueue.main)
-            .sink(
-                receiveCompletion: { _ in },
                 receiveValue: { [weak self] books in
                     self?.books = books
                 }
