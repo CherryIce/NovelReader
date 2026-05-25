@@ -4,6 +4,7 @@ import MobileCoreServices
 struct LibraryView: View {
     @ObservedObject private var viewModel = LibraryViewModel()
     @State private var showingDocumentPicker = false
+    @State private var sheetId = UUID()
     @State private var selectedBook: Book?
     @State private var showingReader = false
     @State private var bookToDelete: Book?
@@ -18,10 +19,11 @@ struct LibraryView: View {
             .navigationBarTitle("书架", displayMode: .automatic)
             .navigationBarItems(trailing: addButton)
             .sheet(isPresented: $showingDocumentPicker) {
-                DocumentPicker(isPresented: $showingDocumentPicker) { url in
+                DocumentPicker { url in
                     viewModel.importBook(from: url)
                 }
             }
+            .id(sheetId)
             // 使用 UIKit 桥接实现全屏模态展示（iOS 13 兼容）
             .background(
                 FullScreenCover(
@@ -75,7 +77,10 @@ struct LibraryView: View {
     }
     
     private var addButton: some View {
-        Button(action: { showingDocumentPicker = true }) {
+        Button(action: {
+            sheetId = UUID()
+            showingDocumentPicker = true
+        }) {
             Image(systemName: "plus")
         }
     }
@@ -421,7 +426,6 @@ struct FullScreenCover: UIViewControllerRepresentable {
 // MARK: - Document Picker
 
 struct DocumentPicker: UIViewControllerRepresentable {
-    @Binding var isPresented: Bool
     let onPick: (URL) -> Void
 
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
@@ -431,36 +435,31 @@ struct DocumentPicker: UIViewControllerRepresentable {
         )
         picker.delegate = context.coordinator
         picker.allowsMultipleSelection = false
+        // 设置为全屏展示，铺满屏幕
+        picker.modalPresentationStyle = .fullScreen
         return picker
     }
 
     func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(isPresented: $isPresented, onPick: onPick)
+        Coordinator(onPick: onPick)
     }
 
     class Coordinator: NSObject, UIDocumentPickerDelegate {
-        @Binding var isPresented: Bool
         let onPick: (URL) -> Void
 
-        init(isPresented: Binding<Bool>, onPick: @escaping (URL) -> Void) {
-            self._isPresented = isPresented
+        init(onPick: @escaping (URL) -> Void) {
             self.onPick = onPick
         }
 
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
             guard let url = urls.first else { return }
             onPick(url)
-            DispatchQueue.main.async {
-                self.isPresented = false
-            }
         }
 
         func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-            DispatchQueue.main.async {
-                self.isPresented = false
-            }
+            // 不需要手动 dismiss 或重置状态，.id() 机制确保下次弹出时 sheet 全新创建
         }
     }
 }
