@@ -5,6 +5,7 @@ struct ReaderView: View {
     @ObservedObject private var viewModel: ReaderViewModel
     @Environment(\.presentationMode) var presentationMode
     @ObservedObject private var themeService = ThemeService.shared
+    @ObservedObject private var speechService = SpeechService.shared
     
     init(book: Book) {
         self.viewModel = ReaderViewModel(book: book)
@@ -170,62 +171,85 @@ struct ReaderView: View {
     // MARK: - 工具栏层（覆盖在内容上方）
     
     private var toolbarLayer: some View {
-        VStack(spacing: 0) {
-            // 顶部工具栏
-            ReaderTopToolbar(
-                title: viewModel.currentPage?.chapterTitle ?? viewModel.book.title,
-                onBack: { presentationMode.wrappedValue.dismiss() },
-                onCatalog: { viewModel.showCatalog = true },
-                onSettings: { viewModel.showSettings = true },
-                onBookmark: { viewModel.toggleBookmark() },
-                onBookmarkList: { viewModel.openBookmarkList() },
-                isBookmarked: viewModel.isCurrentPageBookmarked
-            )
-            .background(
-                // 轻微渐变遮罩
-                LinearGradient(
-                    colors: [
-                        themeService.currentTheme.backgroundColor,
-                        themeService.currentTheme.backgroundColor.opacity(0.8),
-                        themeService.currentTheme.backgroundColor.opacity(0.0)
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-                .frame(height: 20)
-                .offset(y: 44)
-                .allowsHitTesting(false)
-            )
-            
-            Spacer()
-            
-            // 底部工具栏
-            if viewModel.error == nil {
-                ReaderBottomToolbar(
-                    progress: viewModel.readingProgress,
-                    hasPreviousChapter: viewModel.hasPreviousChapter,
-                    hasNextChapter: viewModel.hasNextChapter,
-                    onPreviousChapter: { viewModel.previousChapter() },
-                    onNextChapter: { viewModel.nextChapter() },
-                    onSliderChange: { value in
-                        viewModel.jumpToProgress(value)
-                    }
+        ZStack(alignment: .bottomTrailing) {
+            VStack(spacing: 0) {
+                // 顶部工具栏
+                ReaderTopToolbar(
+                    title: viewModel.currentPage?.chapterTitle ?? viewModel.book.title,
+                    onBack: { presentationMode.wrappedValue.dismiss() },
+                    onSettings: { viewModel.showSettings = true }
                 )
                 .background(
+                    // 轻微渐变遮罩
                     LinearGradient(
                         colors: [
-                            themeService.currentTheme.backgroundColor.opacity(0.0),
+                            themeService.currentTheme.backgroundColor,
                             themeService.currentTheme.backgroundColor.opacity(0.8),
-                            themeService.currentTheme.backgroundColor
+                            themeService.currentTheme.backgroundColor.opacity(0.0)
                         ],
                         startPoint: .top,
                         endPoint: .bottom
                     )
                     .frame(height: 20)
-                    .offset(y: -44)
+                    .offset(y: 44)
                     .allowsHitTesting(false)
                 )
+
+                Spacer()
+
+                // 听书控制面板
+                if viewModel.isSpeaking {
+                    SpeechControlPanel(
+                        isPaused: viewModel.isPaused,
+                        rate: speechService.rate,
+                        pitch: speechService.pitch,
+                        onPauseResume: { viewModel.togglePauseSpeech() },
+                        onStop: { viewModel.toggleSpeech() },
+                        onRateChange: { speechService.rate = $0 },
+                        onPitchChange: { speechService.pitch = $0 }
+                    )
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+
+                // 底部工具栏
+                if viewModel.error == nil {
+                    ReaderBottomToolbar(
+                        onBookmark: { viewModel.toggleBookmark() },
+                        onBookmarkList: { viewModel.openBookmarkList() },
+                        onCatalog: { viewModel.showCatalog = true },
+                        isBookmarked: viewModel.isCurrentPageBookmarked
+                    )
+                    .background(
+                        LinearGradient(
+                            colors: [
+                                themeService.currentTheme.backgroundColor.opacity(0.0),
+                                themeService.currentTheme.backgroundColor.opacity(0.8),
+                                themeService.currentTheme.backgroundColor
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                        .frame(height: 20)
+                        .offset(y: -44)
+                        .allowsHitTesting(false)
+                    )
+                }
             }
+
+            // 听书悬浮按钮
+            Button(action: {
+                viewModel.toggleSpeech()
+            }) {
+                Image(systemName: viewModel.isSpeaking ? (viewModel.isPaused ? "play.fill" : "pause") : "headphones")
+                    .font(.system(size: 20))
+                    .foregroundColor(themeService.currentTheme.textColor)
+                    .padding(12)
+                    .background(themeService.currentTheme.backgroundColor)
+                    .clipShape(Circle())
+                    .shadow(color: .black.opacity(0.2), radius: 4, x: 0, y: 2)
+            }
+            .padding(.trailing, 10)
+            .padding(.bottom, 10)
         }
     }
 }
@@ -465,11 +489,7 @@ struct PageViewController: UIViewControllerRepresentable {
 struct ReaderTopToolbar: View {
     let title: String
     let onBack: () -> Void
-    let onCatalog: () -> Void
     let onSettings: () -> Void
-    let onBookmark: () -> Void
-    let onBookmarkList: () -> Void
-    let isBookmarked: Bool
     @ObservedObject private var themeService = ThemeService.shared
     
     var body: some View {
@@ -487,23 +507,8 @@ struct ReaderTopToolbar: View {
             
             Spacer()
             
-            HStack(spacing: 16) {
-                Button(action: onBookmark) {
-                    Image(systemName: isBookmarked ? "bookmark.fill" : "bookmark")
-                        .foregroundColor(isBookmarked ? .yellow : themeService.currentTheme.textColor)
-                }
-                
-                Button(action: onBookmarkList) {
-                    Image(systemName: "list.bullet")
-                }
-                
-                Button(action: onCatalog) {
-                    Image(systemName: "textformat.size")
-                }
-                
-                Button(action: onSettings) {
-                    Image(systemName: "gearshape")
-                }
+            Button(action: onSettings) {
+                Image(systemName: "gearshape")
             }
         }
         .padding()
@@ -515,35 +520,90 @@ struct ReaderTopToolbar: View {
 // MARK: - 底部工具栏
 
 struct ReaderBottomToolbar: View {
-    let progress: Double
-    let hasPreviousChapter: Bool
-    let hasNextChapter: Bool
-    let onPreviousChapter: () -> Void
-    let onNextChapter: () -> Void
-    let onSliderChange: (Double) -> Void
+    let onBookmark: () -> Void
+    let onBookmarkList: () -> Void
+    let onCatalog: () -> Void
+    let isBookmarked: Bool
     @ObservedObject private var themeService = ThemeService.shared
     
     var body: some View {
-        HStack {
-            Button(action: onPreviousChapter) {
-                Image(systemName: "backward.end.fill")
-                Text("上一章")
+        HStack(spacing: 40) {
+            Button(action: onCatalog) {
+                Image(systemName: "textformat.size")
             }
-            .font(.caption)
-            .disabled(!hasPreviousChapter)
-            .opacity(hasPreviousChapter ? 1 : 0.5)
-            
-            Spacer()
-            
-            Button(action: onNextChapter) {
-                Text("下一章")
-                Image(systemName: "forward.end.fill")
+
+            Button(action: onBookmarkList) {
+                Image(systemName: "list.bullet")
             }
-            .font(.caption)
-            .disabled(!hasNextChapter)
-            .opacity(hasNextChapter ? 1 : 0.5)
+
+            Button(action: onBookmark) {
+                Image(systemName: isBookmarked ? "bookmark.fill" : "bookmark")
+                    .foregroundColor(isBookmarked ? .yellow : themeService.currentTheme.textColor)
+            }
         }
         .padding()
+        .background(themeService.currentTheme.backgroundColor)
+        .foregroundColor(themeService.currentTheme.textColor)
+    }
+}
+
+// MARK: - 听书控制面板
+
+struct SpeechControlPanel: View {
+    let isPaused: Bool
+    let rate: Float
+    let pitch: Float
+    let onPauseResume: () -> Void
+    let onStop: () -> Void
+    let onRateChange: (Float) -> Void
+    let onPitchChange: (Float) -> Void
+    @ObservedObject private var themeService = ThemeService.shared
+    
+    var body: some View {
+        VStack(spacing: 8) {
+            // 语速调节
+            HStack(spacing: 12) {
+                Image(systemName: "tortoise")
+                    .font(.system(size: 12))
+                Text("语速")
+                    .font(.caption)
+                Slider(value: .init(
+                    get: { Double(rate) },
+                    set: { onRateChange(Float($0)) }
+                ), in: 0.3...0.8, step: 0.05)
+                .frame(height: 20)
+                Image(systemName: "hare")
+                    .font(.system(size: 12))
+            }
+            
+            // 音调调节
+            HStack(spacing: 12) {
+                Image(systemName: "waveform")
+                    .font(.system(size: 12))
+                Text("音调")
+                    .font(.caption)
+                Slider(value: .init(
+                    get: { Double(pitch) },
+                    set: { onPitchChange(Float($0)) }
+                ), in: 0.5...2.0, step: 0.1)
+                .frame(height: 20)
+            }
+            
+            // 控制按钮
+            HStack(spacing: 30) {
+                Button(action: onPauseResume) {
+                    Image(systemName: isPaused ? "play.fill" : "pause")
+                        .font(.system(size: 16))
+                }
+                
+                Button(action: onStop) {
+                    Image(systemName: "stop.fill")
+                        .font(.system(size: 16))
+                }
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
         .background(themeService.currentTheme.backgroundColor)
         .foregroundColor(themeService.currentTheme.textColor)
     }

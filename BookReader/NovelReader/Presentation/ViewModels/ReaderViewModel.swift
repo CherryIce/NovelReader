@@ -44,6 +44,10 @@ class ReaderViewModel: ObservableObject {
     /// pages 数组版本号，每次重分页时递增，用于通知 UIPageViewController 强制刷新
     @Published var pagesVersion: Int = 0
     
+    /// 听书状态
+    @Published var isSpeaking: Bool = false
+    @Published var isPaused: Bool = false
+    
     /// 实际可用的视图高度（由 ReaderView 通过 GeometryReader 传入）
     /// 这是安全区域内的高度，已扣除状态栏和底部安全区域
     private var availableViewHeight: CGFloat?
@@ -133,6 +137,21 @@ class ReaderViewModel: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.repaginate()
+            }
+            .store(in: &cancellables)
+        
+        // 监听语音服务状态变化
+        SpeechService.shared.$isSpeaking
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] speaking in
+                self?.isSpeaking = speaking
+            }
+            .store(in: &cancellables)
+        
+        SpeechService.shared.$isPaused
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] paused in
+                self?.isPaused = paused
             }
             .store(in: &cancellables)
     }
@@ -695,6 +714,53 @@ class ReaderViewModel: ObservableObject {
         withAnimation(.easeInOut(duration: 0.2)) {
             showToolbar.toggle()
         }
+    }
+    
+    // MARK: - 听书功能
+    
+    /// 开始/停止听书
+    func toggleSpeech() {
+        if isSpeaking || isPaused {
+            stopSpeech()
+        } else {
+            speakCurrentPage()
+        }
+    }
+    
+    /// 暂停/继续听书
+    func togglePauseSpeech() {
+        if isPaused {
+            SpeechService.shared.resume()
+        } else if isSpeaking {
+            SpeechService.shared.pause()
+        }
+    }
+    
+    /// 朗读当前页内容
+    private func speakCurrentPage() {
+        guard let page = currentPage else { return }
+        
+        SpeechService.shared.speak(page.content) { [weak self] in
+            guard let self = self else { return }
+            
+            // 如果还有下一页，自动翻页继续朗读
+            let nextPageIndex = self.currentPageIndex + 1
+            if nextPageIndex < self.pages.count {
+                self.currentPageIndex = nextPageIndex
+                self.updateProgressForPage(nextPageIndex)
+                self.speakCurrentPage()
+            } else {
+                // 最后一页，停止朗读
+                self.stopSpeech()
+            }
+        }
+    }
+    
+    /// 停止听书
+    private func stopSpeech() {
+        SpeechService.shared.stop()
+        isSpeaking = false
+        isPaused = false
     }
     
     /// 保存阅读进度
