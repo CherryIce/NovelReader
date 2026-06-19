@@ -76,6 +76,12 @@
 	<true/>
 	<key>UIFileSharingEnabled</key>
 	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>WiFi 传书功能需要访问本地网络，以便通过浏览器从电脑向手机传输书籍文件。</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_http._tcp</string>
+	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UIRequiredDeviceCapabilities</key>

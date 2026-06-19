@@ -3,7 +3,10 @@ import MobileCoreServices
 
 struct LibraryView: View {
     @ObservedObject private var viewModel = LibraryViewModel()
+    @ObservedObject private var wifiService = WiFiTransferService.shared
     @State private var showingDocumentPicker = false
+    @State private var showingBatchDocumentPicker = false
+    @State private var showingWiFiTransfer = false
     @State private var sheetId = UUID()
     @State private var selectedBook: Book?
     @State private var showingReader = false
@@ -23,6 +26,14 @@ struct LibraryView: View {
                     viewModel.importBook(from: url)
                 }
             }
+            .sheet(isPresented: $showingBatchDocumentPicker) {
+                BatchDocumentPicker { urls in
+                    viewModel.importBooks(from: urls)
+                }
+            }
+            .sheet(isPresented: $showingWiFiTransfer) {
+                WiFiTransferView()
+            }
             .id(sheetId)
             // 使用 UIKit 桥接实现全屏模态展示（iOS 13 兼容）
             .background(
@@ -37,6 +48,7 @@ struct LibraryView: View {
                 viewModel.loadBooks()
             }
             .overlay(successToast)
+            .overlay(batchImportToast)
         }
     }
     
@@ -55,14 +67,16 @@ struct LibraryView: View {
     
     private var bookGrid: some View {
         Group {
-            if viewModel.books.isEmpty && !viewModel.isImporting {
+            if viewModel.books.isEmpty && !viewModel.isImporting && !viewModel.isBatchImporting {
                 EmptyLibraryView()
             } else {
                 BooksGridView(
                     books: viewModel.books,
-                    isImporting: viewModel.isImporting,
+                    isImporting: viewModel.isImporting || viewModel.isBatchImporting,
                     importingTitle: viewModel.importingBookTitle,
-                    importingProgress: viewModel.importProgress,
+                    importingProgress: viewModel.isBatchImporting
+                        ? viewModel.batchImportProgress
+                        : viewModel.importProgress,
                     onSelect: { book in
                         selectedBook = book
                         showingReader = true
@@ -77,10 +91,27 @@ struct LibraryView: View {
     }
     
     private var addButton: some View {
-        Button(action: {
-            sheetId = UUID()
-            showingDocumentPicker = true
-        }) {
+        Menu {
+            Button(action: {
+                sheetId = UUID()
+                showingDocumentPicker = true
+            }) {
+                Label("导入书籍", systemImage: "doc.badge.plus")
+            }
+            
+            Button(action: {
+                sheetId = UUID()
+                showingBatchDocumentPicker = true
+            }) {
+                Label("批量导入", systemImage: "doc.on.doc")
+            }
+            
+            Button(action: {
+                showingWiFiTransfer = true
+            }) {
+                Label("WiFi 传书", systemImage: "wifi")
+            }
+        } label: {
             Image(systemName: "plus")
         }
     }
@@ -129,6 +160,42 @@ struct LibraryView: View {
                 .onAppear {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
                         viewModel.importSuccess = false
+                    }
+                }
+            }
+        }
+    }
+    
+    private var batchImportToast: some View {
+        Group {
+            if viewModel.batchImportSuccess {
+                VStack {
+                    Spacer()
+                    VStack(spacing: 8) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                            Text("批量导入完成")
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                        }
+                        Text("成功 \(viewModel.batchImportSuccessCount) 个"
+                            + (viewModel.batchImportFailCount > 0
+                                ? "，失败 \(viewModel.batchImportFailCount) 个"
+                                : ""))
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                    .background(Color(.systemGray6))
+                    .cornerRadius(10)
+                    .padding(.bottom, 20)
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .onAppear {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                        viewModel.batchImportSuccess = false
                     }
                 }
             }
@@ -358,7 +425,193 @@ struct EmptyLibraryView: View {
     }
 }
 
-// MARK: - 预览
+// MARK: - WiFi 传书视图
+
+struct WiFiTransferView: View {
+    @ObservedObject var wifiService = WiFiTransferService.shared
+    @State private var showingHelp = false
+    
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 24) {
+                // 顶部状态图标
+                VStack(spacing: 16) {
+                    ZStack {
+                        Circle()
+                            .fill(wifiService.isRunning ? Color.green.opacity(0.15) : Color.gray.opacity(0.1))
+                            .frame(width: 100, height: 100)
+                        
+                        Image(systemName: wifiService.isRunning ? "wifi" : "wifi.slash")
+                            .font(.system(size: 40))
+                            .foregroundColor(wifiService.isRunning ? .green : .gray)
+                    }
+                    
+                    Text(wifiService.isRunning ? "传书服务已开启" : "传书服务未开启")
+                        .font(.headline)
+                        .foregroundColor(wifiService.isRunning ? .green : .secondary)
+                }
+                .padding(.top, 20)
+                
+                // 地址显示
+                if wifiService.isRunning, let url = wifiService.serverURL {
+                    VStack(spacing: 12) {
+                        Text("在电脑浏览器中访问以下地址")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                        
+                        // 地址卡片
+                        HStack {
+                            Image(systemName: "link")
+                                .foregroundColor(.blue)
+                            Text(url)
+                                .font(.system(.body, design: .monospaced))
+                                .foregroundColor(.blue)
+                            Spacer()
+                        }
+                        .padding(16)
+                        .background(Color(.systemGray6))
+                        .cornerRadius(12)
+                        
+                        Button(action: {
+                            UIPasteboard.general.string = url
+                        }) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "doc.on.doc")
+                                Text("复制地址")
+                            }
+                            .font(.subheadline)
+                            .foregroundColor(.blue)
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                }
+                
+                // 上传统计
+                if wifiService.isRunning && wifiService.uploadedCount > 0 {
+                    HStack(spacing: 16) {
+                        StatItem(title: "已上传", value: "\(wifiService.uploadedCount)", icon: "arrow.down.doc")
+                        StatItem(title: "总计", value: "\(wifiService.totalUploadCount)", icon: "doc.text")
+                    }
+                    .padding(.horizontal, 24)
+                }
+                
+                // 上传日志
+                if wifiService.isRunning && !wifiService.uploadLog.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("传输记录")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 4) {
+                                ForEach(wifiService.uploadLog.reversed(), id: \.self) { log in
+                                    Text(log)
+                                        .font(.caption)
+                                        .foregroundColor(.primary)
+                                }
+                            }
+                        }
+                        .frame(maxHeight: 150)
+                        .padding(12)
+                        .background(Color(.systemGray6))
+                        .cornerRadius(10)
+                    }
+                    .padding(.horizontal, 24)
+                }
+                
+                Spacer()
+                
+                // 底部操作按钮
+                VStack(spacing: 12) {
+                    Button(action: {
+                        if wifiService.isRunning {
+                            wifiService.stop()
+                            // WiFi 传书结束后刷新书架
+                            NotificationCenter.default.post(name: .wifiTransferDidFinish, object: nil)
+                        } else {
+                            let _ = wifiService.start()
+                        }
+                    }) {
+                        HStack(spacing: 8) {
+                            Image(systemName: wifiService.isRunning ? "stop.fill" : "play.fill")
+                            Text(wifiService.isRunning ? "停止传书" : "开始传书")
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(wifiService.isRunning ? Color.red : Color.blue)
+                        .foregroundColor(.white)
+                        .cornerRadius(12)
+                    }
+                    
+                    if !wifiService.isRunning {
+                        Button(action: { showingHelp = true }) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "questionmark.circle")
+                                Text("使用帮助")
+                            }
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 30)
+            }
+            .navigationBarTitle("WiFi 传书", displayMode: .inline)
+            .navigationBarItems(trailing: Button("完成") {
+                if wifiService.isRunning {
+                    wifiService.stop()
+                    NotificationCenter.default.post(name: .wifiTransferDidFinish, object: nil)
+                }
+            })
+            .alert(isPresented: $showingHelp) {
+                Alert(
+                    title: Text("使用说明"),
+                    message: Text("1. 确保手机和电脑连接同一 WiFi 网络\n2. 点击「开始传书」启动服务\n3. 在电脑浏览器中输入显示的地址\n4. 在网页中选择文件并上传\n5. 上传完成后在 App 中刷新书架"),
+                    dismissButton: .default(Text("知道了"))
+                )
+            }
+        }
+    }
+}
+
+// MARK: - 统计项
+
+struct StatItem: View {
+    let title: String
+    let value: String
+    let icon: String
+    
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .foregroundColor(.blue)
+                .font(.title3)
+            
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Text(value)
+                    .font(.title3)
+                    .fontWeight(.semibold)
+            }
+            
+            Spacer()
+        }
+        .padding(16)
+        .background(Color(.systemGray6))
+        .cornerRadius(12)
+    }
+}
+
+// MARK: - WiFi 传书完成通知
+
+extension Notification.Name {
+    static let wifiTransferDidFinish = Notification.Name("wifiTransferDidFinish")
+}
+
+// MARK: - Previews
 
 // MARK: - Full Screen Cover (iOS 13 兼容)
 
@@ -467,6 +720,49 @@ struct DocumentPicker: UIViewControllerRepresentable {
         func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
             // 不需要手动 dismiss 或重置状态，.id() 机制确保下次弹出时 sheet 全新创建
         }
+    }
+}
+
+// MARK: - Batch Document Picker
+
+struct BatchDocumentPicker: UIViewControllerRepresentable {
+    let onPick: ([URL]) -> Void
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let supportedTypes: [String] = [
+            kUTTypeText as String,
+            "org.idpf.epub-container",
+            "com.adobe.pdf"
+        ]
+        let picker = UIDocumentPickerViewController(
+            documentTypes: supportedTypes,
+            in: .open
+        )
+        picker.delegate = context.coordinator
+        picker.allowsMultipleSelection = true
+        picker.modalPresentationStyle = .fullScreen
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onPick: onPick)
+    }
+
+    class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onPick: ([URL]) -> Void
+
+        init(onPick: @escaping ([URL]) -> Void) {
+            self.onPick = onPick
+        }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            guard !urls.isEmpty else { return }
+            onPick(urls)
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {}
     }
 }
 

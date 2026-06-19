@@ -14,6 +14,16 @@ class LibraryViewModel: ObservableObject {
     @Published var importedBookTitle: String = ""
     @Published var importingBookTitle: String = ""  // 正在导入的书籍名称，用于显示卡片
     
+    // 批量导入状态
+    @Published var isBatchImporting: Bool = false
+    @Published var batchImportProgress: String = ""
+    @Published var batchImportTotal: Int = 0
+    @Published var batchImportCurrent: Int = 0
+    @Published var batchImportSuccess: Bool = false
+    @Published var batchImportSuccessCount: Int = 0
+    @Published var batchImportFailCount: Int = 0
+    @Published var batchImportFailedTitles: [String] = []
+    
     private let bookRepository: BookRepositoryProtocol
     private let txtParser = TXTParser()
     private let epubParser = EPUBParser()
@@ -100,6 +110,195 @@ class LibraryViewModel: ObservableObject {
                 }
             )
             .store(in: &cancellables)
+    }
+    
+    /// 批量导入书籍
+    func importBooks(from urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        
+        // 重置批量导入状态
+        batchImportSuccess = false
+        batchImportSuccessCount = 0
+        batchImportFailCount = 0
+        batchImportFailedTitles = []
+        batchImportTotal = urls.count
+        batchImportCurrent = 0
+        isBatchImporting = true
+        batchImportProgress = "正在检查 \(urls.count) 个文件..."
+        
+        // 启动所有文件的安全作用域访问
+        var accessTokens: [(url: URL, accessing: Bool)] = []
+        for url in urls {
+            let accessing = url.startAccessingSecurityScopedResource()
+            accessTokens.append((url: url, accessing: accessing))
+        }
+        
+        // 先获取已有书籍列表用于去重
+        bookRepository.getAllBooks()
+            .receive(on: DispatchQueue.main)
+            .sink(
+                receiveCompletion: { _ in },
+                receiveValue: { [weak self] existingBooks in
+                    guard let self = self else { return }
+                    
+                    let existingFileNames = Set(existingBooks.map { book in
+                        URL(fileURLWithPath: book.filePath).lastPathComponent
+                    })
+                    
+                    // 过滤掉已存在的文件
+                    let urlsToImport = accessTokens.filter { token in
+                        let fileName = token.url.lastPathComponent
+                        return !existingFileNames.contains(fileName)
+                    }.map { $0.url }
+                    
+                    // 释放不需要导入的文件的安全作用域
+                    for token in accessTokens {
+                        if !urlsToImport.contains(token.url) && token.accessing {
+                            token.url.stopAccessingSecurityScopedResource()
+                        }
+                    }
+                    
+                    if urlsToImport.isEmpty {
+                        self.isBatchImporting = false
+                        self.batchImportProgress = ""
+                        self.error = .bookAlreadyExists
+                        return
+                    }
+                    
+                    self.batchImportTotal = urlsToImport.count
+                    self.batchImportCurrent = 0
+                    self.batchImportProgress = "准备导入 \(urlsToImport.count) 个文件..."
+                    
+                    // 在后台线程逐个导入
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        self.processBatchImport(urls: urlsToImport)
+                    }
+                }
+            )
+            .store(in: &cancellables)
+    }
+    
+    /// 处理批量导入（在后台线程执行）
+    private func processBatchImport(urls: [URL]) {
+        var successCount = 0
+        var failCount = 0
+        var failedTitles: [String] = []
+        
+        for (index, url) in urls.enumerated() {
+            let bookName = url.deletingPathExtension().lastPathComponent
+            
+            DispatchQueue.main.async {
+                self.batchImportCurrent = index + 1
+                self.batchImportProgress = "正在导入 (\(index + 1)/\(urls.count)): \(bookName)"
+                self.importingBookTitle = bookName
+            }
+            
+            let result = importSingleBook(from: url)
+            
+            switch result {
+            case .success:
+                successCount += 1
+            case .failure(let title):
+                failCount += 1
+                failedTitles.append(title)
+            }
+        }
+        
+        DispatchQueue.main.async {
+            self.isBatchImporting = false
+            self.batchImportProgress = ""
+            self.importingBookTitle = ""
+            self.batchImportSuccess = true
+            self.batchImportSuccessCount = successCount
+            self.batchImportFailCount = failCount
+            self.batchImportFailedTitles = failedTitles
+            self.loadBooks()
+        }
+    }
+    
+    /// 导入单个书籍（同步方法，用于批量导入）
+    private enum ImportResult {
+        case success
+        case failure(String)
+    }
+    
+    private func importSingleBook(from url: URL) -> ImportResult {
+        let ext = url.pathExtension.lowercased()
+        guard ["txt", "epub", "pdf"].contains(ext) || ext.isEmpty else {
+            return .failure(url.lastPathComponent)
+        }
+        
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer {
+            if accessing {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+        
+        do {
+            // 解析书籍
+            let parsedBook: ParsedBook
+            switch ext {
+            case "epub":
+                parsedBook = try epubParser.parse(fileURL: url)
+            case "pdf":
+                parsedBook = try pdfParser.parse(fileURL: url)
+            default:
+                parsedBook = try txtParser.parse(fileURL: url)
+            }
+            
+            // 复制到 Documents 目录
+            let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+            let booksDir = documentsDir.appendingPathComponent("Books")
+            try? FileManager.default.createDirectory(at: booksDir, withIntermediateDirectories: true)
+            
+            let destinationURL = booksDir.appendingPathComponent(url.lastPathComponent)
+            if FileManager.default.fileExists(atPath: destinationURL.path) {
+                try? FileManager.default.removeItem(at: destinationURL)
+            }
+            try FileManager.default.copyItem(at: url, to: destinationURL)
+            
+            // 创建书籍实体
+            let fileSize = (try? FileManager.default.attributesOfItem(atPath: destinationURL.path)[.size] as? Int64) ?? 0
+            let book = Book(
+                title: parsedBook.title,
+                author: parsedBook.author,
+                filePath: destinationURL.path,
+                format: parsedBook.format,
+                fileSize: fileSize
+            )
+            
+            // 保存到数据库（同步方式，使用 Core Data context）
+            let semaphore = DispatchSemaphore(value: 0)
+            var saveError: Error?
+            
+            DispatchQueue.main.async {
+                self.bookRepository.addBook(book)
+                    .receive(on: DispatchQueue.main)
+                    .sink(
+                        receiveCompletion: { completion in
+                            if case .failure(let error) = completion {
+                                saveError = error
+                            }
+                            semaphore.signal()
+                        },
+                        receiveValue: { _ in
+                            semaphore.signal()
+                        }
+                    )
+                    .store(in: &self.cancellables)
+            }
+            
+            semaphore.wait()
+            
+            if let saveError = saveError {
+                return .failure("\(url.lastPathComponent): \(saveError.localizedDescription)")
+            }
+            
+            return .success
+        } catch {
+            return .failure("\(url.lastPathComponent): \(error.localizedDescription)")
+        }
     }
     
     /// 继续导入书籍（去重检查通过后）

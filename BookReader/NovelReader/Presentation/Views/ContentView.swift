@@ -10,6 +10,9 @@ struct ContentView: View {
                         Text("书架")
                     }
                 }
+                .onReceive(NotificationCenter.default.publisher(for: .wifiTransferDidFinish)) { _ in
+                    // WiFi 传书结束后，LibraryView 的 onAppear 会自动刷新
+                }
             
             Text("设置")
                 .tabItem {
