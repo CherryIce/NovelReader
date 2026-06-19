@@ -71,6 +71,8 @@ class ReaderViewModel: ObservableObject {
     private let chapterRepository: ChapterRepositoryProtocol
     private let bookmarkRepository: BookmarkRepositoryProtocol
     private let txtParser = TXTParser()
+    private let epubParser = EPUBParser()
+    private let pdfParser = PDFParser()
     private var cancellables = Set<AnyCancellable>()
     private var currentBookmarks: [Bookmark] = []
     
@@ -309,7 +311,16 @@ class ReaderViewModel: ObservableObject {
         let fileURL = URL(fileURLWithPath: book.filePath)
         
         do {
-            let parsedBook = try txtParser.parse(fileURL: fileURL)
+            // 根据书籍格式选择对应的解析器
+            let parsedBook: ParsedBook
+            switch book.format {
+            case .epub:
+                parsedBook = try epubParser.parse(fileURL: fileURL)
+            case .pdf:
+                parsedBook = try pdfParser.parse(fileURL: fileURL)
+            case .txt:
+                parsedBook = try txtParser.parse(fileURL: fileURL)
+            }
             
             let chapters = parsedBook.chapters.map { parsedChapter in
                 Chapter(

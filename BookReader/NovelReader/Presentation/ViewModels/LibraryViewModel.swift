@@ -16,6 +16,8 @@ class LibraryViewModel: ObservableObject {
     
     private let bookRepository: BookRepositoryProtocol
     private let txtParser = TXTParser()
+    private let epubParser = EPUBParser()
+    private let pdfParser = PDFParser()
     private var cancellables = Set<AnyCancellable>()
     
     init(bookRepository: BookRepositoryProtocol = BookRepository()) {
@@ -47,7 +49,7 @@ class LibraryViewModel: ObservableObject {
     /// 导入书籍
     func importBook(from url: URL) {
         let ext = url.pathExtension.lowercased()
-        guard ext == "txt" || ext.isEmpty else {
+        guard ["txt", "epub", "pdf"].contains(ext) || ext.isEmpty else {
             error = .parseFailed
             return
         }
@@ -119,8 +121,17 @@ class LibraryViewModel: ObservableObject {
                     self.importProgress = "正在解析文件..."
                 }
                 
-                // 解析书籍
-                let parsedBook = try self.txtParser.parse(fileURL: url)
+                // 解析书籍（根据格式选择解析器）
+                let parsedBook: ParsedBook
+                let fileExt = url.pathExtension.lowercased()
+                switch fileExt {
+                case "epub":
+                    parsedBook = try self.epubParser.parse(fileURL: url)
+                case "pdf":
+                    parsedBook = try self.pdfParser.parse(fileURL: url)
+                default:
+                    parsedBook = try self.txtParser.parse(fileURL: url)
+                }
                 
                 // 更新进度：复制文件
                 DispatchQueue.main.async {
@@ -151,7 +162,7 @@ class LibraryViewModel: ObservableObject {
                     title: parsedBook.title,
                     author: parsedBook.author,
                     filePath: destinationURL.path,
-                    format: .txt,
+                    format: parsedBook.format,
                     fileSize: fileSize
                 )
                 

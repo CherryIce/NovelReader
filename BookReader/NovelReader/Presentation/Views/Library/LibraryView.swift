@@ -429,8 +429,14 @@ struct DocumentPicker: UIViewControllerRepresentable {
     let onPick: (URL) -> Void
 
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        // 支持 TXT、EPUB、PDF 三种格式
+        let supportedTypes: [String] = [
+            kUTTypeText as String,           // public.plain-text (TXT)
+            "org.idpf.epub-container",       // EPUB
+            "com.adobe.pdf"                 // PDF
+        ]
         let picker = UIDocumentPickerViewController(
-            documentTypes: [kUTTypeText as String],
+            documentTypes: supportedTypes,
             in: .open
         )
         picker.delegate = context.coordinator
