@@ -62,6 +62,10 @@ struct ReaderView: View {
         }
         .onAppear {
             viewModel.loadBook()
+            ReadingTimeTracker.shared.startReading(bookId: viewModel.book.id, bookTitle: viewModel.book.title)
+        }
+        .onDisappear {
+            ReadingTimeTracker.shared.stopReading()
         }
     }
     

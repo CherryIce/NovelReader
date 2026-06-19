@@ -14,6 +14,14 @@ struct ContentView: View {
                     // WiFi 传书结束后，LibraryView 的 onAppear 会自动刷新
                 }
             
+            ReadingStatsView()
+                .tabItem {
+                    HStack {
+                        Image(systemName: "chart.bar.fill")
+                        Text("统计")
+                    }
+                }
+            
             Text("设置")
                 .tabItem {
                     HStack {
