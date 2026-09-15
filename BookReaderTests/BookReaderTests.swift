@@ -1,4 +1,5 @@
 import Combine
+import CoreText
 import CoreData
 import Foundation
 import Testing
@@ -126,6 +127,47 @@ struct BookReaderTests {
         #expect(pages.count > 500)
         #expect(pages.map(\.content).joined() == content)
         #expect(pages.last?.contentOffset != nil)
+    }
+
+    @Test func everyPaginatedPageFitsTheCoreTextRenderingFrame() {
+        let descriptor = makeDescriptor(viewportWidth: 360, viewportHeight: 779)
+        let paragraph = "要求释放被捕学生。英帝国主义的巡捕镇压群众运动。"
+        let content = Array(repeating: paragraph, count: 200).joined(separator: "\n")
+        let chapter = Chapter(
+            index: 0,
+            title: "第 11-20 页",
+            content: content,
+            length: content.utf16.count
+        )
+
+        let pages = ReaderPaginationService().paginate(
+            chapters: [chapter],
+            descriptor: descriptor
+        )
+        let textContainerSize = ReaderTextLayout.textContainerSize(for: descriptor)
+
+        #expect(!pages.isEmpty)
+        for page in pages {
+            let attributedText = ReaderTextLayout.attributedString(
+                page.content,
+                descriptor: descriptor
+            )
+            let framesetter = CTFramesetterCreateWithAttributedString(
+                attributedText as CFAttributedString
+            )
+            let frame = ReaderTextLayout.frame(
+                framesetter: framesetter,
+                range: CFRange(location: 0, length: attributedText.length),
+                containerSize: textContainerSize
+            )
+            let visibleRange = CTFrameGetVisibleStringRange(frame)
+            let lines = CTFrameGetLines(frame) as? [CTLine] ?? []
+
+            #expect(visibleRange.location == 0)
+            #expect(visibleRange.length == attributedText.length)
+            #expect(lastLineBottom(in: frame, lines: lines) >= 0)
+        }
+        #expect(pages.map(\.content).joined() == content)
     }
 
     @Test func completedStatusSurvivesReadingAnEarlierPage() async throws {
@@ -528,6 +570,17 @@ struct BookReaderTests {
             footerHeight: 30,
             sourceModificationTime: 1_000
         )
+    }
+
+    private func lastLineBottom(in frame: CTFrame, lines: [CTLine]) -> CGFloat {
+        guard let lastLine = lines.last else { return 0 }
+        var origins = [CGPoint](repeating: .zero, count: lines.count)
+        CTFrameGetLineOrigins(frame, CFRange(location: 0, length: lines.count), &origins)
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        var leading: CGFloat = 0
+        CTLineGetTypographicBounds(lastLine, &ascent, &descent, &leading)
+        return origins[lines.count - 1].y - descent
     }
 
     private func publisherValue<Output>(

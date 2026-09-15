@@ -1,3 +1,4 @@
+import CoreText
 import SwiftUI
 import UIKit
 
@@ -267,7 +268,6 @@ struct PageContentView: View {
     let pageIndex: Int
     @ObservedObject var viewModel: ReaderViewModel
     @ObservedObject private var themeService = ThemeService.shared
-    @ObservedObject private var fontService = FontService.shared
     
     private var theme: ReaderTheme {
         themeService.currentTheme
@@ -289,19 +289,23 @@ struct PageContentView: View {
             
             // 中间阅读内容 - 占据剩余空间
             GeometryReader { geometry in
-                Text(page.content)
-                    .font(readerFont)
-                    .foregroundColor(theme.textColor)
-                    .lineSpacing(themeService.lineSpacing)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, ReaderLayoutMetrics.horizontalPadding)
-                    .padding(.top, ReaderLayoutMetrics.contentTopPadding)
-                    .frame(
-                        width: geometry.size.width,
-                        height: geometry.size.height,
-                        alignment: .topLeading
-                    )
-                    .clipped()
+                let descriptor = viewModel.displayPaginationDescriptor
+                let textSize = ReaderTextLayout.textContainerSize(for: descriptor)
+
+                CoreTextPageView(
+                    text: page.content,
+                    descriptor: descriptor,
+                    textColor: theme.textColorUI
+                )
+                .frame(width: textSize.width, height: textSize.height)
+                .padding(.leading, descriptor.horizontalPadding)
+                .padding(.top, descriptor.contentTopPadding)
+                .frame(
+                    width: geometry.size.width,
+                    height: geometry.size.height,
+                    alignment: .topLeading
+                )
+                .clipped()
             }
             
             // 底部页码 - 固定高度区域
@@ -317,12 +321,79 @@ struct PageContentView: View {
         }
         .background(theme.backgroundColor)
     }
+}
 
-    private var readerFont: Font {
-        if fontService.currentFont == "System" {
-            return .system(size: themeService.fontSize)
+/// 使用与分页器相同的 Core Text frame 绘制正文。
+private struct CoreTextPageView: UIViewRepresentable {
+    let text: String
+    let descriptor: PageCacheDescriptor
+    let textColor: UIColor
+
+    func makeUIView(context: Context) -> CoreTextPageUIView {
+        let view = CoreTextPageUIView()
+        update(view)
+        return view
+    }
+
+    func updateUIView(_ uiView: CoreTextPageUIView, context: Context) {
+        update(uiView)
+    }
+
+    private func update(_ view: CoreTextPageUIView) {
+        view.attributedText = ReaderTextLayout.attributedString(
+            text,
+            descriptor: descriptor,
+            foregroundColor: textColor
+        )
+    }
+}
+
+private final class CoreTextPageUIView: UIView {
+    var attributedText = NSAttributedString() {
+        didSet {
+            setNeedsDisplay()
         }
-        return .custom(fontService.currentFont, size: themeService.fontSize)
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        isOpaque = false
+        clipsToBounds = true
+        contentMode = .redraw
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        backgroundColor = .clear
+        isOpaque = false
+        clipsToBounds = true
+        contentMode = .redraw
+    }
+
+    override func draw(_ rect: CGRect) {
+        guard !attributedText.string.isEmpty,
+              bounds.width > 0,
+              bounds.height > 0,
+              let context = UIGraphicsGetCurrentContext() else {
+            return
+        }
+
+        context.saveGState()
+        defer { context.restoreGState() }
+        context.textMatrix = .identity
+        context.translateBy(x: 0, y: bounds.height)
+        context.scaleBy(x: 1, y: -1)
+
+        let framesetter = CTFramesetterCreateWithAttributedString(
+            attributedText as CFAttributedString
+        )
+        let frame = ReaderTextLayout.frame(
+            framesetter: framesetter,
+            range: CFRange(location: 0, length: attributedText.length),
+            containerSize: bounds.size
+        )
+        CTFrameDraw(frame, context)
     }
 }
 

@@ -103,6 +103,11 @@ class ReaderViewModel: ObservableObject {
         pages.count
     }
 
+    /// 当前页面生成时使用的分页配置，显示端必须复用它以保证排版完全一致。
+    var displayPaginationDescriptor: PageCacheDescriptor {
+        activePaginationDescriptor ?? makePaginationDescriptor()
+    }
+
     init(
         book: Book,
         bookRepository: BookRepositoryProtocol = BookRepository(),
@@ -206,8 +211,8 @@ class ReaderViewModel: ObservableObject {
         let descriptor = makePaginationDescriptor()
         if let cachedPages = PageCacheManager.shared.loadCache(for: book.id, expectedDescriptor: descriptor) {
             print("Loaded \(cachedPages.count) pages from cache")
-            self.pages = cachedPages
             self.activePaginationDescriptor = descriptor
+            self.pages = cachedPages
             self.pagesVersion += 1
 
             // 加载书签
@@ -288,8 +293,8 @@ class ReaderViewModel: ObservableObject {
 
             DispatchQueue.main.async {
                 guard generation == self.paginationGeneration else { return }
-                self.pages = allPages
                 self.activePaginationDescriptor = descriptor
+                self.pages = allPages
                 self.pagesVersion += 1
 
                 DispatchQueue.global(qos: .utility).async {

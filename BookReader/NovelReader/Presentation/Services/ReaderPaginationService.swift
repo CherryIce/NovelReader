@@ -21,6 +21,63 @@ enum ReaderLayoutMetrics {
     static let footerHeight: CGFloat = 30
 }
 
+/// 分页和页面绘制共用的 Core Text 配置，避免两套排版引擎产生行高与换行差异。
+enum ReaderTextLayout {
+    static func textContainerSize(for descriptor: PageCacheDescriptor) -> CGSize {
+        CGSize(
+            width: max(1, descriptor.viewportWidth - descriptor.horizontalPadding * 2),
+            height: max(
+                1,
+                descriptor.viewportHeight
+                    - descriptor.headerHeight
+                    - descriptor.contentTopPadding
+                    - descriptor.footerHeight
+            )
+        )
+    }
+
+    static func attributedString(
+        _ text: String,
+        descriptor: PageCacheDescriptor,
+        foregroundColor: UIColor? = nil
+    ) -> NSAttributedString {
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.lineSpacing = descriptor.lineSpacing
+        paragraphStyle.paragraphSpacing = descriptor.paragraphSpacing
+        paragraphStyle.alignment = .left
+
+        let font: UIFont
+        if descriptor.fontName == "System" {
+            font = UIFont.systemFont(ofSize: descriptor.fontSize)
+        } else {
+            font = UIFont(name: descriptor.fontName, size: descriptor.fontSize)
+                ?? UIFont.systemFont(ofSize: descriptor.fontSize)
+        }
+
+        var attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .paragraphStyle: paragraphStyle
+        ]
+        if let foregroundColor {
+            attributes[.foregroundColor] = foregroundColor
+        }
+
+        return NSAttributedString(string: text, attributes: attributes)
+    }
+
+    static func frame(
+        framesetter: CTFramesetter,
+        range: CFRange,
+        containerSize: CGSize
+    ) -> CTFrame {
+        let path = CGPath(
+            rect: CGRect(origin: .zero, size: containerSize),
+            transform: nil
+        )
+        return CTFramesetterCreateFrame(framesetter, range, path, nil)
+    }
+}
+
 protocol ReaderPaginationServiceProtocol {
     func paginate(chapters: [Chapter], descriptor: PageCacheDescriptor) -> [Page]
 }
@@ -28,26 +85,15 @@ protocol ReaderPaginationServiceProtocol {
 /// 纯分页服务：不读写 UI 状态、数据库或缓存，便于独立验证。
 final class ReaderPaginationService: ReaderPaginationServiceProtocol {
     func paginate(chapters: [Chapter], descriptor: PageCacheDescriptor) -> [Page] {
-        let pageWidth = max(1, descriptor.viewportWidth - descriptor.horizontalPadding * 2)
-        let pageHeight = max(
-            1,
-            descriptor.viewportHeight
-                - descriptor.headerHeight
-                - descriptor.contentTopPadding
-                - descriptor.footerHeight
-        )
-        let font = FontService.shared.font(size: descriptor.fontSize)
+        let textContainerSize = ReaderTextLayout.textContainerSize(for: descriptor)
         var pages: [Page] = []
 
         for (chapterIndex, chapter) in chapters.enumerated() {
             pages.append(contentsOf: paginateChapter(
                 chapter,
                 chapterIndex: chapterIndex,
-                pageWidth: pageWidth,
-                pageHeight: pageHeight,
-                font: font,
-                lineSpacing: descriptor.lineSpacing,
-                paragraphSpacing: descriptor.paragraphSpacing,
+                descriptor: descriptor,
+                textContainerSize: textContainerSize,
                 startingGlobalIndex: pages.count
             ))
         }
@@ -58,42 +104,27 @@ final class ReaderPaginationService: ReaderPaginationServiceProtocol {
     private func paginateChapter(
         _ chapter: Chapter,
         chapterIndex: Int,
-        pageWidth: CGFloat,
-        pageHeight: CGFloat,
-        font: UIFont,
-        lineSpacing: CGFloat,
-        paragraphSpacing: CGFloat,
+        descriptor: PageCacheDescriptor,
+        textContainerSize: CGSize,
         startingGlobalIndex: Int
     ) -> [Page] {
         guard !chapter.content.isEmpty else { return [] }
 
         let content = chapter.content as NSString
-        let paragraphStyle = NSMutableParagraphStyle()
-        paragraphStyle.lineSpacing = lineSpacing
-        paragraphStyle.paragraphSpacing = paragraphSpacing
-        paragraphStyle.alignment = .left
-        let attributedContent = NSAttributedString(
-            string: chapter.content,
-            attributes: [
-                .font: font,
-                .paragraphStyle: paragraphStyle
-            ]
+        let attributedContent = ReaderTextLayout.attributedString(
+            chapter.content,
+            descriptor: descriptor
         )
         let framesetter = CTFramesetterCreateWithAttributedString(attributedContent as CFAttributedString)
-        let pagePath = CGPath(
-            rect: CGRect(x: 0, y: 0, width: pageWidth, height: pageHeight),
-            transform: nil
-        )
         var pages: [Page] = []
         var currentOffset = 0
 
         while currentOffset < content.length {
             let remainingLength = content.length - currentOffset
-            let frame = CTFramesetterCreateFrame(
-                framesetter,
-                CFRange(location: currentOffset, length: remainingLength),
-                pagePath,
-                nil
+            let frame = ReaderTextLayout.frame(
+                framesetter: framesetter,
+                range: CFRange(location: currentOffset, length: remainingLength),
+                containerSize: textContainerSize
             )
             let lines = CTFrameGetLines(frame) as? [CTLine] ?? []
             let charsInPage = visibleCharacterCount(
@@ -101,7 +132,7 @@ final class ReaderPaginationService: ReaderPaginationServiceProtocol {
                 frame: frame,
                 currentOffset: currentOffset,
                 remainingLength: remainingLength,
-                pageHeight: pageHeight
+                pageHeight: textContainerSize.height
             )
             let pageContent = content.substring(
                 with: NSRange(location: currentOffset, length: charsInPage)
@@ -144,7 +175,7 @@ final class ReaderPaginationService: ReaderPaginationServiceProtocol {
             CTLineGetTypographicBounds(lines[index], &ascent, &descent, &leading)
             let lineTop = lineOrigins[index].y + ascent
             let lineBottom = lineOrigins[index].y - descent
-            if lineTop <= pageHeight + 0.5, lineBottom >= -0.5 {
+            if lineTop <= pageHeight, lineBottom >= 0 {
                 lastFullyVisibleIndex = index
                 break
             }

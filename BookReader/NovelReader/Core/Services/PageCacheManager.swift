@@ -37,7 +37,7 @@ class PageCacheManager {
     static let shared = PageCacheManager()
     
     /// 缓存版本号 - 当分页算法变更时递增，使旧缓存自动失效
-    private let cacheVersion = 6
+    private let cacheVersion = 7
     
     private let fileManager = FileManager.default
     private let cacheDirectoryName = "PageCache"
