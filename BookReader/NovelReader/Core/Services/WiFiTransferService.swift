@@ -1,22 +1,24 @@
 import Foundation
+import Combine
 import Network
 
 /// WiFi 传书服务 - 在本地局域网启动 HTTP 服务器，允许用户通过浏览器上传书籍
-class WiFiTransferService: NSObject, ObservableObject {
+final class WiFiTransferService: NSObject, ObservableObject {
     static let shared = WiFiTransferService()
 
     @Published var isRunning = false
     @Published var serverURL: String?
     @Published var uploadedCount: Int = 0
     @Published var totalUploadCount: Int = 0
-    @Published var currentUploadingFile: String = ""
-    @Published var uploadProgress: Double = 0
     @Published var uploadLog: [String] = []
 
-    private var server: HTTPServer?
     private var listener: NWListener?
-    private var port: UInt16 = 8080
     private let queue = DispatchQueue(label: "com.bookreader.wifi-transfer", attributes: .concurrent)
+    private let receiveChunkSize = 64 * 1024
+    private let maximumHeaderSize = 32 * 1024
+    private let maximumUploadBodySize = 202 * 1024 * 1024
+    private let maximumSingleFileSize = 200 * 1024 * 1024
+    private var sessionToken = UUID().uuidString
 
     private override init() {
         super.init()
@@ -24,7 +26,7 @@ class WiFiTransferService: NSObject, ObservableObject {
 
     /// 获取本机 IP 地址
     var localIPAddress: String? {
-        var address: String?
+        var fallbackAddress: String?
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
 
         guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return nil }
@@ -32,77 +34,83 @@ class WiFiTransferService: NSObject, ObservableObject {
 
         for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
             let interface = ptr.pointee
-            let addrFamily = interface.ifa_addr.pointee.sa_family
+            guard let socketAddress = interface.ifa_addr else { continue }
+            let addrFamily = socketAddress.pointee.sa_family
 
             if addrFamily == UInt8(AF_INET) {
-                // 跳过回环地址
                 let name = String(cString: interface.ifa_name)
                 if name == "lo0" { continue }
 
                 var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
+                getnameinfo(socketAddress, socklen_t(socketAddress.pointee.sa_len),
                             &hostname, socklen_t(hostname.count),
                             nil, 0, NI_NUMERICHOST)
-                address = String(cString: hostname)
-                break
+                let address = String(cString: hostname)
+                if name == "en0" {
+                    return address
+                }
+                fallbackAddress = fallbackAddress ?? address
             }
         }
-        return address
+        return fallbackAddress
     }
 
     /// 启动服务器
     func start() -> Bool {
-        guard !isRunning else { return true }
+        guard listener == nil else { return true }
 
-        // 尝试找到可用端口
-        for tryPort: UInt16 in 8080..<8100 {
-            if tryStartServer(on: tryPort) {
-                port = tryPort
-                isRunning = true
-                uploadedCount = 0
-                totalUploadCount = 0
-                uploadLog = []
-                if let ip = localIPAddress {
-                    serverURL = "http://\(ip):\(port)"
-                }
-                uploadLog.append("服务器已启动: \(serverURL ?? "未知地址")")
-                return true
-            }
-        }
-
-        uploadLog.append("启动失败：无法找到可用端口")
-        return false
-    }
-
-    /// 尝试在指定端口启动
-    private func tryStartServer(on port: UInt16) -> Bool {
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
 
         do {
-            listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
-            listener?.stateUpdateHandler = { [weak self] state in
+            let newListener = try NWListener(using: parameters, on: .any)
+            sessionToken = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+            uploadedCount = 0
+            totalUploadCount = 0
+            uploadLog = ["正在启动传书服务..."]
+            listener = newListener
+
+            newListener.stateUpdateHandler = { [weak self, weak newListener] state in
+                guard let self else { return }
                 switch state {
                 case .ready:
-                    break
+                    let port = newListener?.port?.rawValue
+                    let ipAddress = self.localIPAddress
+                    DispatchQueue.main.async {
+                        guard self.listener === newListener else { return }
+                        self.isRunning = true
+                        if let port, let ipAddress {
+                            self.serverURL = "http://\(ipAddress):\(port)/?token=\(self.sessionToken)"
+                            self.uploadLog = ["服务器已启动: \(self.serverURL ?? "")"]
+                        } else {
+                            self.serverURL = nil
+                            self.uploadLog = ["服务器已启动，但未找到可访问的 WiFi 地址"]
+                        }
+                    }
                 case .failed(let error):
                     DispatchQueue.main.async {
-                        self?.isRunning = false
-                        self?.serverURL = nil
-                        self?.uploadLog.append("服务器错误: \(error.localizedDescription)")
+                        guard self.listener === newListener else { return }
+                        self.listener = nil
+                        self.isRunning = false
+                        self.serverURL = nil
+                        self.uploadLog.append("服务器错误: \(error.localizedDescription)")
                     }
+                case .cancelled:
+                    break
                 default:
                     break
                 }
             }
 
-            listener?.newConnectionHandler = { [weak self] connection in
+            newListener.newConnectionHandler = { [weak self] connection in
                 self?.handleConnection(connection)
             }
 
-            listener?.start(queue: queue)
+            newListener.start(queue: queue)
             return true
         } catch {
+            listener = nil
+            uploadLog.append("启动失败：\(error.localizedDescription)")
             return false
         }
     }
@@ -110,148 +118,149 @@ class WiFiTransferService: NSObject, ObservableObject {
     /// 处理新连接
     private func handleConnection(_ connection: NWConnection) {
         connection.start(queue: queue)
-
-        // 读取请求
-        readRequest(connection: connection)
+        receiveRequest(connection: connection, buffer: Data())
     }
 
-    /// 读取 HTTP 请求
-    private func readRequest(connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, context, isComplete, error in
-            guard let self = self, let data = data, !data.isEmpty else {
-                if isComplete {
+    private func receiveRequest(connection: NWConnection, buffer: Data) {
+        connection.receive(
+            minimumIncompleteLength: 1,
+            maximumLength: receiveChunkSize,
+            completion: { [weak self] data, _, isComplete, error in
+                guard let self else { return }
+
+                if error != nil {
                     connection.cancel()
+                    return
                 }
-                return
-            }
 
-            // 解析 HTTP 请求
-            if let requestString = String(data: data, encoding: .utf8) {
-                self.handleHTTPRequest(requestString, connection: connection)
-            } else {
-                // 二进制数据，可能是上传的文件体
-                self.handleHTTPRequest("", connection: connection)
+                var updatedBuffer = buffer
+                if let data {
+                    updatedBuffer.append(data)
+                }
+
+                guard let headerRange = updatedBuffer.range(of: Data("\r\n\r\n".utf8)) else {
+                    if updatedBuffer.count > self.maximumHeaderSize {
+                        self.sendResponse(connection: connection, statusCode: 431, body: "Request Header Too Large")
+                    } else if isComplete {
+                        self.sendResponse(connection: connection, statusCode: 400, body: "Incomplete Request")
+                    } else {
+                        self.receiveRequest(connection: connection, buffer: updatedBuffer)
+                    }
+                    return
+                }
+
+                guard headerRange.lowerBound <= self.maximumHeaderSize,
+                      let headerString = String(
+                        data: updatedBuffer[..<headerRange.lowerBound],
+                        encoding: .utf8
+                      ),
+                      let requestHead = self.parseRequestHead(headerString) else {
+                    self.sendResponse(connection: connection, statusCode: 400, body: "Bad Request")
+                    return
+                }
+
+                let contentLength = requestHead.headers["content-length"].flatMap(Int.init) ?? 0
+                guard contentLength >= 0, contentLength <= self.maximumUploadBodySize else {
+                    self.sendResponse(connection: connection, statusCode: 413, body: "Upload Too Large")
+                    return
+                }
+
+                let expectedLength = headerRange.upperBound + contentLength
+                guard expectedLength <= self.maximumHeaderSize + self.maximumUploadBodySize else {
+                    self.sendResponse(connection: connection, statusCode: 413, body: "Upload Too Large")
+                    return
+                }
+
+                if updatedBuffer.count < expectedLength {
+                    if isComplete {
+                        self.sendResponse(connection: connection, statusCode: 400, body: "Incomplete Request Body")
+                    } else {
+                        self.receiveRequest(connection: connection, buffer: updatedBuffer)
+                    }
+                    return
+                }
+
+                let body = Data(updatedBuffer[headerRange.upperBound..<expectedLength])
+                self.handleHTTPRequest(requestHead: requestHead, body: body, connection: connection)
             }
-        }
+        )
     }
 
-    /// 处理 HTTP 请求
-    private func handleHTTPRequest(_ requestString: String, connection: NWConnection) {
-        let lines = requestString.components(separatedBy: "\r\n")
-        guard !lines.isEmpty else {
-            sendResponse(connection: connection, statusCode: 400, body: "Bad Request")
-            return
-        }
+    private struct HTTPRequestHead {
+        let method: String
+        let target: String
+        let headers: [String: String]
+    }
 
-        let firstLine = lines[0]
-        let parts = firstLine.split(separator: " ")
-        guard parts.count >= 2 else {
-            sendResponse(connection: connection, statusCode: 400, body: "Bad Request")
-            return
-        }
+    private func parseRequestHead(_ headerString: String) -> HTTPRequestHead? {
+        let lines = headerString.components(separatedBy: "\r\n")
+        guard let firstLine = lines.first else { return nil }
+        let requestParts = firstLine.split(separator: " ", maxSplits: 2)
+        guard requestParts.count == 3 else { return nil }
 
-        let method = String(parts[0])
-        let path = String(parts[1])
-
-        // 解析 headers
         var headers: [String: String] = [:]
         for line in lines.dropFirst() {
-            if line.isEmpty { break }
-            let colonIndex = line.firstIndex(of: ":")
-            if let colonIndex = colonIndex {
-                let key = String(line[..<colonIndex]).trimmingCharacters(in: .whitespaces).lowercased()
-                let value = String(line[line.index(after: colonIndex)...]).trimmingCharacters(in: .whitespaces)
-                headers[key] = value
-            }
+            guard let colonIndex = line.firstIndex(of: ":") else { continue }
+            let key = String(line[..<colonIndex]).trimmingCharacters(in: .whitespaces).lowercased()
+            let value = String(line[line.index(after: colonIndex)...]).trimmingCharacters(in: .whitespaces)
+            headers[key] = value
         }
 
-        // 路由
-        if method == "GET" && path == "/" || path == "/index.html" {
-            serveUploadPage(connection: connection)
-        } else if method == "POST" && path == "/upload" {
-            // 读取请求体
-            readUploadBody(connection: connection, headers: headers, firstData: nil)
-        } else if method == "GET" && path == "/status" {
-            serveStatus(connection: connection)
-        } else {
-            sendResponse(connection: connection, statusCode: 404, body: "Not Found")
-        }
+        return HTTPRequestHead(
+            method: String(requestParts[0]).uppercased(),
+            target: String(requestParts[1]),
+            headers: headers
+        )
     }
 
-    /// 读取上传的文件体
-    private func readUploadBody(connection: NWConnection, headers: [String: String], firstData: Data?) {
-        var allData = firstData ?? Data()
-
-        // 获取 Content-Length
-        let contentLength = Int(headers["content-length"] ?? "0") ?? 0
-
-        if contentLength == 0 {
-            sendResponse(connection: connection, statusCode: 400, body: "No Content-Length")
+    private func handleHTTPRequest(requestHead: HTTPRequestHead, body: Data, connection: NWConnection) {
+        guard let components = URLComponents(string: "http://localhost\(requestHead.target)") else {
+            sendResponse(connection: connection, statusCode: 400, body: "Bad Request")
             return
         }
 
-        // 获取 boundary
-        let contentType = headers["content-type"] ?? ""
-        let boundary = extractBoundary(from: contentType)
+        let token = components.queryItems?.first(where: { $0.name == "token" })?.value
+        guard token == sessionToken else {
+            sendResponse(connection: connection, statusCode: 401, body: "Unauthorized")
+            return
+        }
 
-        connection.receive(minimumIncompleteLength: contentLength, maximumLength: contentLength + 1024) { [weak self] data, _, _, error in
-            guard let self = self else { return }
-
-            if let data = data {
-                allData.append(data)
-            }
-
-            if allData.count >= contentLength {
-                self.processUpload(data: allData, boundary: boundary, connection: connection)
-            } else {
-                // 继续读取
-                self.readUploadBody(connection: connection, headers: headers, firstData: allData)
-            }
+        switch (requestHead.method, components.path) {
+        case ("GET", "/"), ("GET", "/index.html"):
+            serveUploadPage(connection: connection)
+        case ("POST", "/upload"):
+            let contentType = requestHead.headers["content-type"] ?? ""
+            processUpload(data: body, boundary: extractBoundary(from: contentType), connection: connection)
+        default:
+            sendResponse(connection: connection, statusCode: 404, body: "Not Found")
         }
     }
 
     /// 提取 multipart boundary
     private func extractBoundary(from contentType: String) -> String {
-        guard let boundaryRange = contentType.range(of: "boundary=") else { return "" }
-        let boundary = String(contentType[boundaryRange.upperBound...])
-        // 去除可能的引号
-        return boundary.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+        guard let boundaryRange = contentType.range(of: "boundary=", options: .caseInsensitive) else { return "" }
+        let value = contentType[boundaryRange.upperBound...].split(separator: ";", maxSplits: 1).first ?? ""
+        return value.trimmingCharacters(in: CharacterSet(charactersIn: "\" "))
     }
 
     /// 处理上传的文件
     private func processUpload(data: Data, boundary: String, connection: NWConnection) {
-        guard !boundary.isEmpty else {
+        guard !boundary.isEmpty, boundary.utf8.count <= 200 else {
             sendResponse(connection: connection, statusCode: 400, body: "Invalid multipart")
             return
         }
 
-        let boundaryData = "--\(boundary)".data(using: .utf8)!
-
-        // 分割 multipart 数据
-        let parts = data.split(separator: boundaryData, omittingEmptySubsequences: false)
-
+        let parts = multipartParts(in: data, boundary: boundary)
         var uploadedFiles: [String] = []
         var failedFiles: [String] = []
+        var uploadedURLs: [URL] = []
+        let uploadDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BookReaderWiFiUploads", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
 
         for part in parts {
-            guard !part.isEmpty else { continue }
-            let partString = String(data: part, encoding: .utf8) ?? ""
-
-            // 提取文件名
-            guard let filenameRange = partString.range(of: "filename=\"", options: .caseInsensitive) else { continue }
-            let afterFilename = partString[filenameRange.upperBound...]
-            guard let endQuote = afterFilename.firstIndex(of: "\"") else { continue }
-            let filename = String(afterFilename[..<endQuote])
-
-            // 提取文件内容（在空行之后）
-            guard let headerEndRange = part.range(of: Data("\r\n\r\n".utf8)) else { continue }
-            let fileData = part[headerEndRange.upperBound...]
-
-            // 去除末尾的 \r\n
-            var cleanData = fileData
-            if cleanData.count >= 2 {
-                cleanData.removeLast(2)
-            }
+            guard let parsedPart = parseMultipartFile(part) else { continue }
+            let filename = parsedPart.filename
 
             // 验证文件类型
             let ext = (filename as NSString).pathExtension.lowercased()
@@ -260,34 +269,25 @@ class WiFiTransferService: NSObject, ObservableObject {
                 continue
             }
 
-            // 保存文件
-            let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-            let booksDir = documentsDir.appendingPathComponent("Books")
-            try? FileManager.default.createDirectory(at: booksDir, withIntermediateDirectories: true)
-
-            let destinationURL = booksDir.appendingPathComponent(filename)
+            guard parsedPart.data.count <= maximumSingleFileSize else {
+                failedFiles.append("\(filename): 文件超过 200MB")
+                continue
+            }
 
             do {
-                if FileManager.default.fileExists(atPath: destinationURL.path) {
-                    try FileManager.default.removeItem(at: destinationURL)
-                }
-                try cleanData.write(to: destinationURL)
+                try FileManager.default.createDirectory(at: uploadDirectory, withIntermediateDirectories: true)
+                let destinationURL = uploadDirectory.appendingPathComponent(filename, isDirectory: false)
+                try parsedPart.data.write(to: destinationURL, options: [.atomic, .withoutOverwriting])
                 uploadedFiles.append(filename)
+                uploadedURLs.append(destinationURL)
             } catch {
                 failedFiles.append("\(filename): \(error.localizedDescription)")
             }
         }
 
-        // 返回结果
-        var result = "{"
-        result += "\"success\": \(uploadedFiles.count),"
-        result += "\"failed\": \(failedFiles.count),"
-        result += "\"files\": ["
-        result += uploadedFiles.map { "\"\($0)\"" }.joined(separator: ",")
-        result += "],"
-        result += "\"errors\": ["
-        result += failedFiles.map { "\"\($0)\"" }.joined(separator: ",")
-        result += "]}"
+        if uploadedURLs.isEmpty {
+            try? FileManager.default.removeItem(at: uploadDirectory)
+        }
 
         DispatchQueue.main.async {
             self.uploadedCount += uploadedFiles.count
@@ -298,12 +298,77 @@ class WiFiTransferService: NSObject, ObservableObject {
             for error in failedFiles {
                 self.uploadLog.append("❌ \(error)")
             }
+
+            if !uploadedURLs.isEmpty {
+                NotificationCenter.default.post(
+                    name: .wifiTransferDidReceiveFiles,
+                    object: self,
+                    userInfo: [WiFiTransferNotificationKey.fileURLs: uploadedURLs]
+                )
+            }
         }
 
-        sendResponse(connection: connection,
-                     statusCode: 200,
-                     contentType: "application/json",
-                     body: result)
+        sendJSONResponse(
+            connection: connection,
+            statusCode: 200,
+            object: [
+                "success": uploadedFiles.count,
+                "failed": failedFiles.count,
+                "files": uploadedFiles,
+                "errors": failedFiles
+            ]
+        )
+    }
+
+    private func multipartParts(in data: Data, boundary: String) -> [Data] {
+        let marker = Data("--\(boundary)".utf8)
+        guard let firstBoundary = data.range(of: marker) else { return [] }
+
+        var parts: [Data] = []
+        var partStart = firstBoundary.upperBound
+        while partStart < data.endIndex,
+              let nextBoundary = data.range(of: marker, in: partStart..<data.endIndex) {
+            var part = Data(data[partStart..<nextBoundary.lowerBound])
+            if part.starts(with: Data("\r\n".utf8)) {
+                part.removeFirst(2)
+            }
+            if part.suffix(2) == Data("\r\n".utf8) {
+                part.removeLast(2)
+            }
+            if !part.isEmpty, !part.starts(with: Data("--".utf8)) {
+                parts.append(part)
+            }
+            partStart = nextBoundary.upperBound
+        }
+        return parts
+    }
+
+    private func parseMultipartFile(_ part: Data) -> (filename: String, data: Data)? {
+        guard let headerRange = part.range(of: Data("\r\n\r\n".utf8)),
+              let header = String(data: part[..<headerRange.lowerBound], encoding: .utf8),
+              let filenameMarker = header.range(of: "filename=\"", options: .caseInsensitive) else {
+            return nil
+        }
+
+        let filenameTail = header[filenameMarker.upperBound...]
+        guard let closingQuote = filenameTail.firstIndex(of: "\"") else { return nil }
+        let rawFilename = String(filenameTail[..<closingQuote])
+        guard let filename = sanitizedFilename(rawFilename) else { return nil }
+
+        return (filename, Data(part[headerRange.upperBound...]))
+    }
+
+    private func sanitizedFilename(_ rawFilename: String) -> String? {
+        let normalized = rawFilename.replacingOccurrences(of: "\\", with: "/")
+        let filename = (normalized as NSString).lastPathComponent
+        guard filename == normalized,
+              filename != ".",
+              filename != "..",
+              !filename.isEmpty,
+              filename.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
+            return nil
+        }
+        return filename
     }
 
     /// 返回上传页面
@@ -496,7 +561,7 @@ class WiFiTransferService: NSObject, ObservableObject {
 
                 <div class="result" id="result"></div>
 
-                <p class="hint">上传完成后，请在 App 中刷新书架查看</p>
+                <p class="hint">上传完成后，App 会自动导入书架</p>
             </div>
 
             <input type="file" id="fileInput" multiple accept=".txt,.epub,.pdf">
@@ -553,10 +618,20 @@ class WiFiTransferService: NSObject, ObservableObject {
                         const size = f.size < 1024*1024
                             ? (f.size/1024).toFixed(1) + ' KB'
                             : (f.size/1024/1024).toFixed(1) + ' MB';
-                        div.innerHTML = '<span class="icon">' + icon + '</span>'
-                            + '<span class="name">' + f.name + '</span>'
-                            + '<span class="size">' + size + '</span>'
-                            + '<span class="remove" onclick="removeFile(' + i + ')">×</span>';
+                        const iconSpan = document.createElement('span');
+                        iconSpan.className = 'icon';
+                        iconSpan.textContent = icon;
+                        const nameSpan = document.createElement('span');
+                        nameSpan.className = 'name';
+                        nameSpan.textContent = f.name;
+                        const sizeSpan = document.createElement('span');
+                        sizeSpan.className = 'size';
+                        sizeSpan.textContent = size;
+                        const removeSpan = document.createElement('span');
+                        removeSpan.className = 'remove';
+                        removeSpan.textContent = '×';
+                        removeSpan.addEventListener('click', () => removeFile(i));
+                        div.append(iconSpan, nameSpan, sizeSpan, removeSpan);
                         fileList.appendChild(div);
                     });
                     uploadBtn.disabled = selectedFiles.length === 0;
@@ -581,7 +656,7 @@ class WiFiTransferService: NSObject, ObservableObject {
 
                     try {
                         const xhr = new XMLHttpRequest();
-                        xhr.open('POST', '/upload');
+                        xhr.open('POST', '/upload' + window.location.search);
 
                         xhr.upload.onprogress = (e) => {
                             if (e.lengthComputable) {
@@ -637,36 +712,54 @@ class WiFiTransferService: NSObject, ObservableObject {
         sendResponse(connection: connection, statusCode: 200, contentType: "text/html; charset=utf-8", body: html)
     }
 
-    /// 返回状态 JSON
-    private func serveStatus(connection: NWConnection) {
-        let status = "{"
-        status += "\"isRunning\": \(isRunning),"
-        status += "\"uploadedCount\": \(uploadedCount),"
-        status += "\"serverURL\": \"\(serverURL ?? "")\""
-        status += "}"
-        sendResponse(connection: connection, statusCode: 200, contentType: "application/json", body: status)
+    private func sendJSONResponse(connection: NWConnection, statusCode: Int, object: [String: Any]) {
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object) else {
+            sendResponse(connection: connection, statusCode: 500, body: "Internal Server Error")
+            return
+        }
+        sendResponse(
+            connection: connection,
+            statusCode: statusCode,
+            contentType: "application/json; charset=utf-8",
+            bodyData: data
+        )
     }
 
     /// 发送 HTTP 响应
     private func sendResponse(connection: NWConnection, statusCode: Int, contentType: String = "text/plain; charset=utf-8", body: String) {
+        sendResponse(
+            connection: connection,
+            statusCode: statusCode,
+            contentType: contentType,
+            bodyData: Data(body.utf8)
+        )
+    }
+
+    private func sendResponse(connection: NWConnection, statusCode: Int, contentType: String, bodyData: Data) {
         let statusText: String
         switch statusCode {
         case 200: statusText = "OK"
         case 400: statusText = "Bad Request"
+        case 401: statusText = "Unauthorized"
         case 404: statusText = "Not Found"
+        case 413: statusText = "Payload Too Large"
+        case 431: statusText = "Request Header Fields Too Large"
         case 500: statusText = "Internal Server Error"
         default: statusText = "Unknown"
         }
 
-        let response = "HTTP/1.1 \(statusCode) \(statusText)\r\n"
+        let responseHead = "HTTP/1.1 \(statusCode) \(statusText)\r\n"
             + "Content-Type: \(contentType)\r\n"
-            + "Content-Length: \(body.utf8.count)\r\n"
+            + "Content-Length: \(bodyData.count)\r\n"
             + "Connection: close\r\n"
-            + "Access-Control-Allow-Origin: *\r\n"
+            + "X-Content-Type-Options: nosniff\r\n"
             + "\r\n"
-            + body
 
-        connection.send(content: Data(response.utf8), completion: .contentProcessed { _ in
+        var response = Data(responseHead.utf8)
+        response.append(bodyData)
+
+        connection.send(content: response, completion: .contentProcessed { _ in
             connection.cancel()
         })
     }
@@ -683,12 +776,10 @@ class WiFiTransferService: NSObject, ObservableObject {
     }
 }
 
-// MARK: - NWConnection 扩展
+enum WiFiTransferNotificationKey {
+    static let fileURLs = "fileURLs"
+}
 
-private extension NWConnection {
-    func receive(minimumIncompleteLength: Int, maximumLength: Int, handler: @escaping (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void) {
-        self.receive(minimumIncompleteLength: minimumIncompleteLength, maximumLength: maximumLength) { data, context, isComplete, error in
-            handler(data, context, isComplete, error)
-        }
-    }
+extension Notification.Name {
+    static let wifiTransferDidReceiveFiles = Notification.Name("wifiTransferDidReceiveFiles")
 }

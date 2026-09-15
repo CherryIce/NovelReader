@@ -120,9 +120,8 @@ class PDFParser {
         // 获取目标页码
         var pageIndex = 0
         if let destination = node.destination,
-           let pageRef = destination.page,
-           let index = document.index(for: pageRef) {
-            pageIndex = index
+           let page = destination.page {
+            pageIndex = document.index(for: page)
         }
         
         if !title.isEmpty {
@@ -130,10 +129,10 @@ class PDFParser {
         }
         
         // 遍历子节点
-        var child = node.child
-        while child != nil {
-            traverseOutline(child!, level: level + 1, nodes: &nodes, document: document)
-            child = child?.next
+        for childIndex in 0..<node.numberOfChildren {
+            if let child = node.child(at: childIndex) {
+                traverseOutline(child, level: level + 1, nodes: &nodes, document: document)
+            }
         }
     }
     

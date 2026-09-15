@@ -65,6 +65,37 @@ class BookRepository: BookRepositoryProtocol {
         }
         .eraseToAnyPublisher()
     }
+
+    func addBook(_ book: Book, chapters: [Chapter]) -> AnyPublisher<Book, Error> {
+        Future { promise in
+            self.context.perform {
+                let duplicateRequest: NSFetchRequest<BookEntity> = BookEntity.fetchRequest()
+                duplicateRequest.predicate = NSPredicate(format: "filePath == %@", book.filePath)
+                duplicateRequest.fetchLimit = 1
+
+                do {
+                    guard try self.context.fetch(duplicateRequest).isEmpty else {
+                        promise(.failure(BookError.bookAlreadyExists))
+                        return
+                    }
+
+                    let bookEntity = BookEntity(context: self.context)
+                    bookEntity.fromBook(book)
+                    for chapter in chapters {
+                        let chapterEntity = ChapterEntity(context: self.context)
+                        chapterEntity.fromChapter(chapter, book: bookEntity)
+                    }
+
+                    try self.context.save()
+                    promise(.success(book))
+                } catch {
+                    self.context.rollback()
+                    promise(.failure(error))
+                }
+            }
+        }
+        .eraseToAnyPublisher()
+    }
     
     func updateBook(_ book: Book) -> AnyPublisher<Book, Error> {
         Future { promise in

@@ -11,9 +11,6 @@ struct ContentView: View {
                         Text("书架")
                     }
                 }
-                .onReceive(NotificationCenter.default.publisher(for: .wifiTransferDidFinish)) { _ in
-                    // WiFi 传书结束后，LibraryView 的 onAppear 会自动刷新
-                }
             
             BookSearchView()
                 .tabItem {
@@ -43,7 +40,7 @@ struct ContentView: View {
 }
 
 struct BookSearchView: View {
-    @ObservedObject private var viewModel = LibraryViewModel()
+    @StateObject private var viewModel = LibraryViewModel()
     @State private var selectedBook: Book?
 
     var body: some View {

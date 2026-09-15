@@ -2,7 +2,7 @@ import AVFoundation
 import Combine
 
 /// 语音朗读服务 - 封装 AVSpeechSynthesizer
-class SpeechService: ObservableObject {
+final class SpeechService: NSObject, ObservableObject {
     static let shared = SpeechService()
     
     /// 是否正在朗读
@@ -19,15 +19,19 @@ class SpeechService: ObservableObject {
     
     private let synthesizer: AVSpeechSynthesizer
     private var continuation: (() -> Void)?
+    private var currentUtterance: AVSpeechUtterance?
     
-    private init() {
+    private override init() {
         synthesizer = AVSpeechSynthesizer()
+        super.init()
         synthesizer.delegate = self
     }
     
     /// 朗读文本，完成后执行回调
     func speak(_ text: String, completion: (() -> Void)? = nil) {
         // 先停止之前的朗读
+        continuation = nil
+        currentUtterance = nil
         synthesizer.stopSpeaking(at: .immediate)
         
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -42,7 +46,8 @@ class SpeechService: ObservableObject {
         utterance.rate = rate
         utterance.pitchMultiplier = pitch
         utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
-        
+
+        currentUtterance = utterance
         synthesizer.speak(utterance)
         isSpeaking = true
         isPaused = false
@@ -64,10 +69,11 @@ class SpeechService: ObservableObject {
     
     /// 停止朗读
     func stop() {
-        synthesizer.stopSpeaking(at: .immediate)
+        continuation = nil
+        currentUtterance = nil
         isSpeaking = false
         isPaused = false
-        continuation = nil
+        synthesizer.stopSpeaking(at: .immediate)
     }
 }
 
@@ -80,13 +86,18 @@ extension SpeechService: AVSpeechSynthesizerDelegate {
     }
     
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        guard utterance === currentUtterance else { return }
+        currentUtterance = nil
+        let completion = continuation
+        continuation = nil
         isSpeaking = false
         isPaused = false
-        continuation?()
-        continuation = nil
+        completion?()
     }
     
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        guard utterance === currentUtterance else { return }
+        currentUtterance = nil
         isSpeaking = false
         isPaused = false
         continuation = nil

@@ -5,8 +5,9 @@ import Combine
 class ReadingStatsRepository: ReadingStatsRepositoryProtocol {
     private let context: NSManagedObjectContext
     
-    init(context: NSManagedObjectContext = PersistenceController.shared.container.viewContext) {
+    init(context: NSManagedObjectContext = PersistenceController.shared.container.newBackgroundContext()) {
         self.context = context
+        self.context.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
     }
     
     func saveReadingSession(_ session: ReadingSession) -> AnyPublisher<Void, Error> {
@@ -121,55 +122,9 @@ class ReadingStatsRepository: ReadingStatsRepositoryProtocol {
     }
     
     func getAllBookStats() -> AnyPublisher<[BookReadingStats], Error> {
-        Future { promise in
-            self.context.perform {
-                let request: NSFetchRequest<ReadingSessionEntity> = ReadingSessionEntity.fetchRequest()
-                request.sortDescriptors = [NSSortDescriptor(key: "startTime", ascending: false)]
-                
-                do {
-                    let entities = try self.context.fetch(request)
-                    
-                    // 按书籍分组统计
-                    var statsByBook: [UUID: BookReadingStats] = [:]
-                    
-                    for entity in entities {
-                        let bookId = entity.bookId ?? UUID()
-                        let bookTitle = entity.bookTitle ?? ""
-                        let duration = entity.duration
-                        let endTime = entity.endTime
-                        
-                        if var existingStats = statsByBook[bookId] {
-                            let newTotalTime = existingStats.totalReadingTime + duration
-                            let newSessionsCount = existingStats.sessionsCount + 1
-                            let lastReadAt = existingStats.lastReadAt
-                            
-                            statsByBook[bookId] = BookReadingStats(
-                                id: existingStats.id,
-                                bookId: bookId,
-                                bookTitle: bookTitle,
-                                totalReadingTime: newTotalTime,
-                                lastReadAt: max(lastReadAt ?? Date.distantPast, endTime ?? Date.distantPast),
-                                sessionsCount: newSessionsCount
-                            )
-                        } else {
-                            statsByBook[bookId] = BookReadingStats(
-                                bookId: bookId,
-                                bookTitle: bookTitle,
-                                totalReadingTime: duration,
-                                lastReadAt: endTime,
-                                sessionsCount: 1
-                            )
-                        }
-                    }
-                    
-                    let stats = Array(statsByBook.values).sorted { $0.totalReadingTime > $1.totalReadingTime }
-                    promise(.success(stats))
-                } catch {
-                    promise(.failure(error))
-                }
-            }
-        }
-        .eraseToAnyPublisher()
+        getDashboardStats()
+            .map(\.bookStats)
+            .eraseToAnyPublisher()
     }
     
     func getBookStats(forBookId bookId: UUID) -> AnyPublisher<BookReadingStats?, Error> {
@@ -207,37 +162,23 @@ class ReadingStatsRepository: ReadingStatsRepositoryProtocol {
     }
     
     func getReadingStatsSummary() -> AnyPublisher<ReadingStatsSummary, Error> {
+        getDashboardStats()
+            .map(\.summary)
+            .eraseToAnyPublisher()
+    }
+
+    func getDashboardStats() -> AnyPublisher<ReadingStatsDashboard, Error> {
         Future { promise in
             self.context.perform {
                 let request: NSFetchRequest<ReadingSessionEntity> = ReadingSessionEntity.fetchRequest()
-                
+                request.sortDescriptors = [NSSortDescriptor(key: "startTime", ascending: false)]
+
                 do {
                     let entities = try self.context.fetch(request)
-                    
-                    let totalTime = entities.reduce(0) { $0 + $1.duration }
-                    let totalSessions = entities.count
-                    
-                    // 计算今日阅读时长
-                    let calendar = Calendar.current
-                    let startOfDay = calendar.startOfDay(for: Date())
-                    let todayTime = entities
-                        .filter { ($0.startTime ?? Date.distantPast) >= startOfDay }
-                        .reduce(0) { $0 + $1.duration }
-                    
-                    // 获取有阅读记录的唯一书籍数量
-                    let uniqueBookIds = Set(entities.compactMap { $0.bookId })
-                    
-                    // 计算连续阅读天数
-                    let streakDays = self.calculateStreakDays(from: entities)
-                    
-                    let summary = ReadingStatsSummary(
-                        totalReadingTime: totalTime,
-                        todayReadingTime: todayTime,
-                        totalBooksRead: uniqueBookIds.count,
-                        totalSessions: totalSessions,
-                        streakDays: streakDays
-                    )
-                    promise(.success(summary))
+                    promise(.success(ReadingStatsDashboard(
+                        bookStats: self.makeBookStats(from: entities),
+                        summary: self.makeSummary(from: entities)
+                    )))
                 } catch {
                     promise(.failure(error))
                 }
@@ -266,6 +207,55 @@ class ReadingStatsRepository: ReadingStatsRepositoryProtocol {
     }
     
     // MARK: - 私有方法
+
+    private func makeBookStats(from entities: [ReadingSessionEntity]) -> [BookReadingStats] {
+        var statsByBook: [UUID: BookReadingStats] = [:]
+
+        for entity in entities {
+            guard let bookId = entity.bookId else { continue }
+            let bookTitle = entity.bookTitle ?? ""
+            let duration = entity.duration
+            let endTime = entity.endTime
+
+            if let existingStats = statsByBook[bookId] {
+                statsByBook[bookId] = BookReadingStats(
+                    id: existingStats.id,
+                    bookId: bookId,
+                    bookTitle: bookTitle,
+                    totalReadingTime: existingStats.totalReadingTime + duration,
+                    lastReadAt: max(existingStats.lastReadAt ?? .distantPast, endTime ?? .distantPast),
+                    sessionsCount: existingStats.sessionsCount + 1
+                )
+            } else {
+                statsByBook[bookId] = BookReadingStats(
+                    bookId: bookId,
+                    bookTitle: bookTitle,
+                    totalReadingTime: duration,
+                    lastReadAt: endTime,
+                    sessionsCount: 1
+                )
+            }
+        }
+
+        return statsByBook.values.sorted { $0.totalReadingTime > $1.totalReadingTime }
+    }
+
+    private func makeSummary(from entities: [ReadingSessionEntity]) -> ReadingStatsSummary {
+        let totalTime = entities.reduce(0) { $0 + $1.duration }
+        let calendar = Calendar.current
+        let startOfDay = calendar.startOfDay(for: Date())
+        let todayTime = entities
+            .filter { ($0.startTime ?? .distantPast) >= startOfDay }
+            .reduce(0) { $0 + $1.duration }
+
+        return ReadingStatsSummary(
+            totalReadingTime: totalTime,
+            todayReadingTime: todayTime,
+            totalBooksRead: Set(entities.compactMap(\.bookId)).count,
+            totalSessions: entities.count,
+            streakDays: calculateStreakDays(from: entities)
+        )
+    }
     
     /// 计算连续阅读天数
     private func calculateStreakDays(from entities: [ReadingSessionEntity]) -> Int {

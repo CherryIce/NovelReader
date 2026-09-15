@@ -2,13 +2,13 @@ import SwiftUI
 import UIKit
 
 struct ReaderView: View {
-    @ObservedObject private var viewModel: ReaderViewModel
+    @StateObject private var viewModel: ReaderViewModel
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var themeService = ThemeService.shared
     @ObservedObject private var speechService = SpeechService.shared
     
     init(book: Book) {
-        self.viewModel = ReaderViewModel(book: book)
+        _viewModel = StateObject(wrappedValue: ReaderViewModel(book: book))
     }
     
     var body: some View {
@@ -39,6 +39,7 @@ struct ReaderView: View {
         }
         .onDisappear {
             ReadingTimeTracker.shared.stopReading()
+            viewModel.stopSpeech()
         }
         .statusBar(hidden: !viewModel.showToolbar)
         .navigationBarHidden(true)

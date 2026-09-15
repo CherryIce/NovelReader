@@ -158,6 +158,127 @@ struct BookReaderTests {
         )
     }
 
+    @Test func atomicImportPersistsChaptersAndRejectsDuplicateFilePath() async throws {
+        let persistence = PersistenceController(inMemory: true)
+        let bookRepository = BookRepository(context: persistence.container.newBackgroundContext())
+        let chapterRepository = ChapterRepository(context: persistence.container.newBackgroundContext())
+        let filePath = "/tmp/atomic-import-\(UUID().uuidString).txt"
+        let book = Book(title: "原子导入", filePath: filePath, format: .txt)
+        let chapters = [
+            Chapter(index: 0, title: "第一章", content: "正文一", startLocation: 0, length: 3),
+            Chapter(index: 1, title: "第二章", content: "正文二", startLocation: 3, length: 3)
+        ]
+
+        let savedBook = try await publisherValue(bookRepository.addBook(book, chapters: chapters))
+        let savedChapters = try await publisherValue(chapterRepository.getChapters(forBookId: book.id))
+
+        #expect(savedBook == book)
+        #expect(savedChapters.map(\.title) == ["第一章", "第二章"])
+
+        let duplicate = Book(title: "重复导入", filePath: filePath, format: .txt)
+        do {
+            _ = try await publisherValue(bookRepository.addBook(duplicate, chapters: chapters))
+            Issue.record("相同文件路径应被拒绝")
+        } catch BookError.bookAlreadyExists {
+            #expect(true)
+        } catch {
+            Issue.record("重复导入返回了错误类型：\(error)")
+        }
+
+        #expect(try await publisherValue(bookRepository.getAllBooks()).count == 1)
+    }
+
+    @Test func dashboardStatsAggregateBooksAndSummaryFromSameSessions() async throws {
+        let persistence = PersistenceController(inMemory: true)
+        let repository = ReadingStatsRepository(context: persistence.container.newBackgroundContext())
+        let firstBookId = UUID()
+        let secondBookId = UUID()
+        let now = Date()
+        let sessions = [
+            ReadingSession(
+                bookId: firstBookId,
+                bookTitle: "第一本",
+                startTime: now.addingTimeInterval(-180),
+                endTime: now.addingTimeInterval(-120)
+            ),
+            ReadingSession(
+                bookId: firstBookId,
+                bookTitle: "第一本",
+                startTime: now.addingTimeInterval(-120),
+                endTime: now
+            ),
+            ReadingSession(
+                bookId: secondBookId,
+                bookTitle: "第二本",
+                startTime: now.addingTimeInterval(-30),
+                endTime: now
+            )
+        ]
+
+        for session in sessions {
+            _ = try await publisherValue(repository.saveReadingSession(session))
+        }
+
+        let dashboard = try await publisherValue(repository.getDashboardStats())
+        let statsByBook = Dictionary(uniqueKeysWithValues: dashboard.bookStats.map { ($0.bookId, $0) })
+
+        #expect(dashboard.summary.totalReadingTime == 210)
+        #expect(dashboard.summary.totalSessions == 3)
+        #expect(dashboard.summary.totalBooksRead == 2)
+        #expect(statsByBook[firstBookId]?.totalReadingTime == 180)
+        #expect(statsByBook[firstBookId]?.sessionsCount == 2)
+        #expect(statsByBook[secondBookId]?.totalReadingTime == 30)
+    }
+
+    @Test @MainActor func backgroundPauseExcludesTimeSpentAwayFromTheApp() async throws {
+        let persistence = PersistenceController(inMemory: true)
+        let repository = ReadingStatsRepository(context: persistence.container.newBackgroundContext())
+        var currentDate = Date()
+        let tracker = ReadingTimeTracker(
+            repository: repository,
+            now: { currentDate },
+            minimumSessionDuration: 5,
+            notificationCenter: NotificationCenter()
+        )
+
+        tracker.startReading(bookId: UUID(), bookTitle: "计时测试")
+        currentDate = currentDate.addingTimeInterval(2)
+        tracker.pauseReading()
+        currentDate = currentDate.addingTimeInterval(100)
+        tracker.resumeReading()
+        currentDate = currentDate.addingTimeInterval(6)
+        tracker.stopReading()
+
+        let sessions = try await publisherValue(repository.getAllSessions())
+        #expect(sessions.count == 1)
+        #expect(sessions.first?.duration == 6)
+    }
+
+    @Test @MainActor func successfulImportPublishesSavedBookWithoutReloading() async throws {
+        let repository = RecordingBookRepository()
+        let viewModel = LibraryViewModel(bookRepository: repository)
+        let sourceURL = temporaryFileURL(name: "visible-after-import.txt")
+        let booksDirectory = try #require(
+            FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        ).appendingPathComponent("Books", isDirectory: true)
+        let destinationURL = booksDirectory.appendingPathComponent(sourceURL.lastPathComponent)
+        defer {
+            try? FileManager.default.removeItem(at: sourceURL)
+            try? FileManager.default.removeItem(at: destinationURL)
+        }
+        try "第一章\n导入完成后应立即显示".write(to: sourceURL, atomically: true, encoding: .utf8)
+
+        viewModel.importBook(from: sourceURL)
+        for _ in 0..<200 where !viewModel.importSuccess {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        #expect(viewModel.importSuccess)
+        #expect(!viewModel.isImporting)
+        #expect(viewModel.books.count == 1)
+        #expect(viewModel.books.first?.filePath == destinationURL.path)
+    }
+
     @Test @MainActor func singlePageBookHasFiniteCompletedProgress() {
         let repository = RecordingBookRepository()
         let book = Book(title: "短篇", filePath: "/tmp/short.txt", format: .txt)
@@ -246,6 +367,10 @@ private final class RecordingBookRepository: BookRepositoryProtocol {
     }
 
     func addBook(_ book: Book) -> AnyPublisher<Book, Error> {
+        success(book)
+    }
+
+    func addBook(_ book: Book, chapters: [Chapter]) -> AnyPublisher<Book, Error> {
         success(book)
     }
 

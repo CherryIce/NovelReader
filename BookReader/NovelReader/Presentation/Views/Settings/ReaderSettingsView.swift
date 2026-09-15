@@ -8,6 +8,7 @@ struct ReaderSettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var showingFontPicker = false
     @State private var fontImportFailed = false
+    @State private var pendingFontURL: URL?
 
     init(showsDoneButton: Bool = true) {
         self.showsDoneButton = showsDoneButton
@@ -99,11 +100,15 @@ struct ReaderSettingsView: View {
                     }
                 }
             })
-            .sheet(isPresented: $showingFontPicker) {
-                DocumentPicker(contentTypes: [.font]) { url in
-                    if !fontService.importFont(from: url) {
-                        fontImportFailed = true
-                    }
+            .sheet(isPresented: $showingFontPicker, onDismiss: {
+                guard let url = pendingFontURL else { return }
+                pendingFontURL = nil
+                if !fontService.importFont(from: url) {
+                    fontImportFailed = true
+                }
+            }) {
+                DocumentPicker(isPresented: $showingFontPicker, contentTypes: [.font]) { url in
+                    pendingFontURL = url
                 }
             }
             .alert(isPresented: $fontImportFailed) {

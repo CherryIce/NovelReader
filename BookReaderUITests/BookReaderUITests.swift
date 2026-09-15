@@ -31,6 +31,7 @@ final class BookReaderUITests: XCTestCase {
         XCTAssertTrue(tabBar.waitForExistence(timeout: 5))
         XCTAssertTrue(tabBar.buttons["书架"].exists)
         XCTAssertTrue(tabBar.buttons["搜索"].exists)
+        XCTAssertTrue(tabBar.buttons["统计"].exists)
         XCTAssertTrue(tabBar.buttons["设置"].exists)
 
         tabBar.buttons["搜索"].tap()

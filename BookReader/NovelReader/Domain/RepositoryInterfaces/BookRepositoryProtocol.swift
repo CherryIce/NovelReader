@@ -11,6 +11,9 @@ protocol BookRepositoryProtocol {
     
     /// 添加书籍
     func addBook(_ book: Book) -> AnyPublisher<Book, Error>
+
+    /// 在同一个 Core Data 事务中添加书籍及其章节
+    func addBook(_ book: Book, chapters: [Chapter]) -> AnyPublisher<Book, Error>
     
     /// 更新书籍
     func updateBook(_ book: Book) -> AnyPublisher<Book, Error>

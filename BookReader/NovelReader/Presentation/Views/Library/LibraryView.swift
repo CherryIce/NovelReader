@@ -2,12 +2,10 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct LibraryView: View {
-    @ObservedObject private var viewModel = LibraryViewModel()
+    @StateObject private var viewModel = LibraryViewModel()
     @ObservedObject private var wifiService = WiFiTransferService.shared
-    @State private var showingDocumentPicker = false
     @State private var showingBatchDocumentPicker = false
     @State private var showingWiFiTransfer = false
-    @State private var sheetId = UUID()
     @State private var selectedBook: Book?
     @State private var bookToDelete: Book?
     @State private var showingDeleteConfirmation = false
@@ -17,25 +15,27 @@ struct LibraryView: View {
             ZStack {
                 backgroundLayer
                 contentLayer
+                importProgressOverlay
             }
+            .animation(.easeInOut(duration: 0.2), value: viewModel.isImporting)
+            .animation(.easeInOut(duration: 0.2), value: viewModel.isBatchImporting)
             .navigationBarTitle("书架", displayMode: .automatic)
             .navigationBarItems(trailing: addButton)
-            .sheet(isPresented: $showingDocumentPicker) {
-                DocumentPicker(
-                    contentTypes: [.plainText, .pdf, UTType(filenameExtension: "epub") ?? .data]
-                ) { url in
-                    viewModel.importBook(from: url)
-                }
-            }
-            .sheet(isPresented: $showingBatchDocumentPicker) {
-                BatchDocumentPicker { urls in
+            .fileImporter(
+                isPresented: $showingBatchDocumentPicker,
+                allowedContentTypes: supportedBookTypes,
+                allowsMultipleSelection: true
+            ) { result in
+                switch result {
+                case .success(let urls):
                     viewModel.importBooks(from: urls)
+                case .failure(let error):
+                    presentPickerError(error)
                 }
             }
             .sheet(isPresented: $showingWiFiTransfer) {
                 WiFiTransferView()
             }
-            .id(sheetId)
             .fullScreenCover(item: $selectedBook) { book in
                 ReaderView(book: book)
             }
@@ -44,6 +44,13 @@ struct LibraryView: View {
             .onAppear {
                 viewModel.loadBooks()
             }
+            .onReceive(NotificationCenter.default.publisher(for: .wifiTransferDidReceiveFiles)) { notification in
+                guard let urls = notification.userInfo?[WiFiTransferNotificationKey.fileURLs] as? [URL],
+                      !urls.isEmpty else {
+                    return
+                }
+                viewModel.importBooks(from: urls, removesSourceWhenFinished: true)
+            }
             .overlay(successToast)
             .overlay(batchImportToast)
         }
@@ -51,9 +58,57 @@ struct LibraryView: View {
 
     // MARK: - Subviews
 
+    private var supportedBookTypes: [UTType] {
+        [.plainText, .pdf, UTType(filenameExtension: "epub") ?? .data]
+    }
+
+    private func presentPickerError(_ error: Error) {
+        let cocoaError = error as NSError
+        guard !(cocoaError.domain == NSCocoaErrorDomain && cocoaError.code == NSUserCancelledError) else {
+            return
+        }
+        viewModel.error = .operationFailed(message: error.localizedDescription)
+    }
+
     private var backgroundLayer: some View {
         Color(.systemBackground)
             .ignoresSafeArea()
+    }
+
+    @ViewBuilder
+    private var importProgressOverlay: some View {
+        if viewModel.isImporting || viewModel.isBatchImporting {
+            ZStack {
+                Color.black.opacity(0.16)
+                    .ignoresSafeArea()
+
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .progressViewStyle(CircularProgressViewStyle())
+                        .scaleEffect(1.2)
+
+                    Text(viewModel.importingBookTitle.isEmpty ? "正在导入书籍" : viewModel.importingBookTitle)
+                        .font(.headline)
+                        .lineLimit(1)
+
+                    Text(viewModel.isBatchImporting ? viewModel.batchImportProgress : viewModel.importProgress)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(2)
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 20)
+                .frame(maxWidth: 280)
+                .background(Color(.systemBackground))
+                .cornerRadius(14)
+                .shadow(color: Color.black.opacity(0.18), radius: 18, y: 8)
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("library.importProgress")
+            }
+            .zIndex(1)
+            .transition(.opacity.combined(with: .scale(scale: 0.96)))
+        }
     }
 
     private var contentLayer: some View {
@@ -120,14 +175,6 @@ struct LibraryView: View {
     private var addButton: some View {
         Menu {
             Button(action: {
-                sheetId = UUID()
-                showingDocumentPicker = true
-            }) {
-                Label("导入书籍", systemImage: "doc.badge.plus")
-            }
-
-            Button(action: {
-                sheetId = UUID()
                 showingBatchDocumentPicker = true
             }) {
                 Label("批量导入", systemImage: "doc.on.doc")
@@ -534,7 +581,7 @@ struct EmptyLibraryView: View {
                 .font(.headline)
                 .foregroundColor(.secondary)
 
-            Text("点击右上角 + 导入书籍")
+            Text("点击右上角 + 批量导入")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
         }
@@ -546,6 +593,7 @@ struct EmptyLibraryView: View {
 
 struct WiFiTransferView: View {
     @ObservedObject var wifiService = WiFiTransferService.shared
+    @Environment(\.dismiss) private var dismiss
     @State private var showingHelp = false
 
     var body: some View {
@@ -643,8 +691,6 @@ struct WiFiTransferView: View {
                     Button(action: {
                         if wifiService.isRunning {
                             wifiService.stop()
-                            // WiFi 传书结束后刷新书架
-                            NotificationCenter.default.post(name: .wifiTransferDidFinish, object: nil)
                         } else {
                             let _ = wifiService.start()
                         }
@@ -676,15 +722,16 @@ struct WiFiTransferView: View {
             }
             .navigationBarTitle("WiFi 传书", displayMode: .inline)
             .navigationBarItems(trailing: Button("完成") {
-                if wifiService.isRunning {
-                    wifiService.stop()
-                    NotificationCenter.default.post(name: .wifiTransferDidFinish, object: nil)
-                }
+                wifiService.stop()
+                dismiss()
             })
+            .onDisappear {
+                wifiService.stop()
+            }
             .alert(isPresented: $showingHelp) {
                 Alert(
                     title: Text("使用说明"),
-                    message: Text("1. 确保手机和电脑连接同一 WiFi 网络\n2. 点击「开始传书」启动服务\n3. 在电脑浏览器中输入显示的地址\n4. 在网页中选择文件并上传\n5. 上传完成后在 App 中刷新书架"),
+                    message: Text("1. 确保手机和电脑连接同一 WiFi 网络\n2. 点击「开始传书」启动服务\n3. 在电脑浏览器中输入显示的完整地址\n4. 在网页中选择文件并上传\n5. 上传完成后 App 会自动导入书架"),
                     dismissButton: .default(Text("知道了"))
                 )
             }
@@ -722,17 +769,10 @@ struct StatItem: View {
     }
 }
 
-// MARK: - WiFi 传书完成通知
-
-extension Notification.Name {
-    static let wifiTransferDidFinish = Notification.Name("wifiTransferDidFinish")
-}
-
-// MARK: - Previews
-
-// MARK: - Document Picker
+// MARK: - Shared Document Picker
 
 struct DocumentPicker: UIViewControllerRepresentable {
+    @Binding var isPresented: Bool
     let contentTypes: [UTType]
     let onPick: (URL) -> Void
 
@@ -743,7 +783,6 @@ struct DocumentPicker: UIViewControllerRepresentable {
         )
         picker.delegate = context.coordinator
         picker.allowsMultipleSelection = false
-        // 设置为全屏展示，铺满屏幕
         picker.modalPresentationStyle = .fullScreen
         return picker
     }
@@ -751,67 +790,28 @@ struct DocumentPicker: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onPick: onPick)
+        Coordinator(isPresented: $isPresented, onPick: onPick)
     }
 
-    class Coordinator: NSObject, UIDocumentPickerDelegate {
-        let onPick: (URL) -> Void
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        private let isPresented: Binding<Bool>
+        private let onPick: (URL) -> Void
 
-        init(onPick: @escaping (URL) -> Void) {
+        init(isPresented: Binding<Bool>, onPick: @escaping (URL) -> Void) {
+            self.isPresented = isPresented
             self.onPick = onPick
         }
 
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            guard let url = urls.first else { return }
-            onPick(url)
+            if let url = urls.first {
+                onPick(url)
+            }
+            isPresented.wrappedValue = false
         }
 
         func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-            // 不需要手动 dismiss 或重置状态，.id() 机制确保下次弹出时 sheet 全新创建
+            isPresented.wrappedValue = false
         }
-    }
-}
-
-// MARK: - Batch Document Picker
-
-struct BatchDocumentPicker: UIViewControllerRepresentable {
-    let onPick: ([URL]) -> Void
-
-    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        let supportedTypes: [UTType] = [
-            .plainText,
-            .pdf,
-            UTType(filenameExtension: "epub") ?? .data
-        ]
-        let picker = UIDocumentPickerViewController(
-            forOpeningContentTypes: supportedTypes,
-            asCopy: false
-        )
-        picker.delegate = context.coordinator
-        picker.allowsMultipleSelection = true
-        picker.modalPresentationStyle = .fullScreen
-        return picker
-    }
-
-    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onPick: onPick)
-    }
-
-    class Coordinator: NSObject, UIDocumentPickerDelegate {
-        let onPick: ([URL]) -> Void
-
-        init(onPick: @escaping ([URL]) -> Void) {
-            self.onPick = onPick
-        }
-
-        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            guard !urls.isEmpty else { return }
-            onPick(urls)
-        }
-
-        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {}
     }
 }
 

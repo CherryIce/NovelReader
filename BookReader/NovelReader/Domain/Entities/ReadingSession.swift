@@ -77,6 +77,11 @@ struct ReadingStatsSummary: Codable {
     }
 }
 
+struct ReadingStatsDashboard {
+    let bookStats: [BookReadingStats]
+    let summary: ReadingStatsSummary
+}
+
 // MARK: - 时间格式化扩展
 
 extension TimeInterval {

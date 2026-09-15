@@ -480,7 +480,7 @@ class ReaderViewModel: ObservableObject {
     }
 
     /// 停止听书
-    private func stopSpeech() {
+    func stopSpeech() {
         SpeechService.shared.stop()
         isSpeaking = false
         isPaused = false

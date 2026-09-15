@@ -1,6 +1,19 @@
 import Foundation
 import UIKit
 
+private func containedFileURL(baseURL: URL, relativePath: String) -> URL? {
+    let normalizedPath = relativePath.replacingOccurrences(of: "\\", with: "/")
+    guard !normalizedPath.isEmpty, !normalizedPath.hasPrefix("/") else { return nil }
+
+    let standardizedBase = baseURL.standardizedFileURL
+    let candidate = standardizedBase.appendingPathComponent(normalizedPath).standardizedFileURL
+    let basePrefix = standardizedBase.path.hasSuffix("/")
+        ? standardizedBase.path
+        : standardizedBase.path + "/"
+    guard candidate.path.hasPrefix(basePrefix) else { return nil }
+    return candidate
+}
+
 /// EPUB 文件解析器
 /// EPUB 本质是 ZIP 压缩包，内含 XHTML/HTML 内容文件
 class EPUBParser {
@@ -43,7 +56,9 @@ class EPUBParser {
         }
         
         let opfRelativePath = parseContainerXML(containerXML)
-        let opfFullPath = tempDir.appendingPathComponent(opfRelativePath)
+        guard let opfFullPath = containedFileURL(baseURL: tempDir, relativePath: opfRelativePath) else {
+            throw ParserError.parseFailed
+        }
         let opfDir = opfFullPath.deletingLastPathComponent()
         
         // 5. 解析 OPF 文件获取元数据和阅读顺序
@@ -67,7 +82,9 @@ class EPUBParser {
             
             // 解码 URL（处理 percent encoding）
             let decodedHref = href.removingPercentEncoding ?? href
-            let contentPath = opfDir.appendingPathComponent(decodedHref)
+            guard let contentPath = containedFileURL(baseURL: opfDir, relativePath: decodedHref) else {
+                continue
+            }
             
             // 读取内容文件
             guard let contentData = FileManager.default.contents(atPath: contentPath.path),
@@ -154,7 +171,6 @@ class EPUBParser {
         }
         
         // 提取 manifest 项
-        let manifestPattern = #"<item\s+[^>]*id="([^"]+)"[^>]*(?:href="([^"]*)")?[^>]*(?:media-type="([^"]*)")?[^>]*/?\s*>"#
         // 使用更宽松的正则来匹配 manifest item
         let itemPattern = #"<item\s+([^>]+)/?>|<item\s+([^>]+)>"#
         if let regex = try? NSRegularExpression(pattern: itemPattern, options: [.caseInsensitive]) {
@@ -162,10 +178,12 @@ class EPUBParser {
             regex.enumerateMatches(in: xml, options: [], range: fullRange) { match, _, _ in
                 guard let match = match else { return }
                 let tagContent: String
-                if let r1 = match.range(at: 1), r1.location != NSNotFound {
-                    tagContent = (xml as NSString).substring(with: r1)
-                } else if let r2 = match.range(at: 2), r2.location != NSNotFound {
-                    tagContent = (xml as NSString).substring(with: r2)
+                let firstRange = match.range(at: 1)
+                let secondRange = match.range(at: 2)
+                if firstRange.location != NSNotFound {
+                    tagContent = (xml as NSString).substring(with: firstRange)
+                } else if secondRange.location != NSNotFound {
+                    tagContent = (xml as NSString).substring(with: secondRange)
                 } else {
                     return
                 }
@@ -220,7 +238,7 @@ class EPUBParser {
         // 提取 body 内容
         let bodyContent: String
         if let bodyRange = html.range(of: "<body", options: .caseInsensitive),
-           let bodyStart = html.range(of: ">", range: bodyRange..<html.endIndex),
+           let bodyStart = html.range(of: ">", range: bodyRange.upperBound..<html.endIndex),
            let bodyEnd = html.range(of: "</body>", options: .caseInsensitive, range: bodyStart.upperBound..<html.endIndex) {
             bodyContent = String(html[bodyStart.upperBound..<bodyEnd.lowerBound])
         } else {
@@ -348,7 +366,6 @@ class EPUBParser {
     /// 从 HTML 属性字符串中提取指定属性值
     private func extractAttribute(_ tagContent: String, name: String) -> String? {
         // 匹配 name="value" 或 name='value'
-        let pattern = #"\#(name)\s*=\s*["']([^"']*)["']"#
         // 动态构建正则
         let dynamicPattern = "\(name)\\s*=\\s*[\"']([^\"']*)[\"']"
         guard let regex = try? NSRegularExpression(pattern: dynamicPattern, options: [.caseInsensitive]) else {
@@ -403,7 +420,7 @@ class EPUBParser {
 extension FileManager {
     /// 解压 ZIP 文件到目标目录（使用系统内置的 libcompression）
     func unzipItem(at sourceURL: URL, to destinationURL: URL) throws {
-        guard let archive = Archive(url: sourceURL, accessMode: .read) else {
+        guard let archive = Archive(url: sourceURL) else {
             throw ParserError.parseFailed
         }
         
@@ -417,10 +434,13 @@ import Compression
 
 /// 简易 ZIP Archive 解压器
 /// 仅支持 DEFLATE 和 STORE 方法，满足 EPUB 需求
-private class Archive {
+private final class Archive {
     private let fileHandle: FileHandle
+    private let fileSize: UInt64
     private let centralDirectoryOffset: UInt64
     private var entries: [Entry] = []
+    private static let maximumEntrySize: UInt64 = 64 * 1024 * 1024
+    private static let maximumTotalUncompressedSize: UInt64 = 256 * 1024 * 1024
     
     struct Entry {
         let filename: String
@@ -431,89 +451,101 @@ private class Archive {
         let crc32: UInt32
     }
     
-    init?(url: URL, accessMode: AccessMode) {
-        guard accessMode == .read,
-              let handle = try? FileHandle(forReadingFrom: url) else {
+    init?(url: URL) {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
             return nil
         }
         self.fileHandle = handle
-        
+
         do {
             // 读取 End of Central Directory Record
             let fileSize = try handle.seekToEnd()
-            try handle.seek(toOffset: max(0, fileSize - 1024))
-            let tailData = handle.readData(upToCount: min(1024, Int(fileSize)))
-            
-            guard let eocdOffset = findEOCD(in: tailData, totalSize: fileSize) else {
+            self.fileSize = fileSize
+            let maximumEOCDSearchLength = 65_557
+            let tailLength = min(maximumEOCDSearchLength, Int(fileSize))
+            try handle.seek(toOffset: fileSize - UInt64(tailLength))
+            let tailData = handle.readData(ofLength: tailLength)
+
+            guard let eocdOffset = Self.findEOCD(in: tailData),
+                  let totalEntries = tailData.readUInt16LE(at: eocdOffset + 10),
+                  let centralDirectorySize = tailData.readUInt32LE(at: eocdOffset + 12),
+                  let centralDirectoryOffset = tailData.readUInt32LE(at: eocdOffset + 16) else {
                 handle.closeFile()
                 return nil
             }
-            
-            try handle.seek(toOffset: fileSize - UInt64(tailData.count) + UInt64(eocdOffset))
-            let eocdData = handle.readData(upToCount: 22)
-            guard eocdData.count == 22 else {
+
+            let directoryEnd = UInt64(centralDirectoryOffset) + UInt64(centralDirectorySize)
+            guard directoryEnd <= fileSize else {
                 handle.closeFile()
                 return nil
             }
-            
-            let eocd = eocdData.withUnsafeBytes { ptr -> EOCDRecord in
-                return EOCDRecord(
-                    totalEntries: ptr.load(fromByteOffset: 10, as: UInt16.self).littleEndian,
-                    centralDirectorySize: ptr.load(fromByteOffset: 12, as: UInt32.self).littleEndian,
-                    centralDirectoryOffset: ptr.load(fromByteOffset: 16, as: UInt32.self).littleEndian
-                )
-            }
-            
-            self.centralDirectoryOffset = UInt64(eocd.centralDirectoryOffset)
-            
+
+            self.centralDirectoryOffset = UInt64(centralDirectoryOffset)
+
             // 解析 Central Directory
             try handle.seek(toOffset: self.centralDirectoryOffset)
-            let cdData = handle.readData(upToCount: Int(eocd.centralDirectorySize))
-            
+            let cdData = handle.readData(ofLength: Int(centralDirectorySize))
+            guard cdData.count == Int(centralDirectorySize) else {
+                handle.closeFile()
+                return nil
+            }
+
             var offset = 0
-            for _ in 0..<eocd.totalEntries {
-                guard offset + 46 <= cdData.count else { break }
-                
-                let signature = cdData.withUnsafeBytes { $0.load(fromByteOffset: offset, as: UInt32.self) }
-                guard signature == 0x02014B50 else { break }
-                
-                let entry = cdData.withUnsafeBytes { ptr -> Entry in
-                    let base = offset
-                    let compressionMethod = ptr.load(fromByteOffset: base + 10, as: UInt16.self).littleEndian
-                    let compressedSize = ptr.load(fromByteOffset: base + 20, as: UInt32.self).littleEndian
-                    let uncompressedSize = ptr.load(fromByteOffset: base + 24, as: UInt32.self).littleEndian
-                    let filenameLength = ptr.load(fromByteOffset: base + 28, as: UInt16.self).littleEndian
-                    let extraLength = ptr.load(fromByteOffset: base + 30, as: UInt16.self).littleEndian
-                    let commentLength = ptr.load(fromByteOffset: base + 32, as: UInt16.self).littleEndian
-                    let localHeaderOffset = ptr.load(fromByteOffset: base + 42, as: UInt32.self).littleEndian
-                    let crc32 = ptr.load(fromByteOffset: base + 16, as: UInt32.self).littleEndian
-                    
-                    let filenameStart = base + 46
-                    let filenameData = Data(bytes: ptr.baseAddress!.advanced(by: filenameStart), count: Int(filenameLength))
-                    let filename = String(data: filenameData, encoding: .utf8) ?? ""
-                    
-                    return Entry(
-                        filename: filename,
-                        compressedSize: compressedSize,
-                        uncompressedSize: uncompressedSize,
-                        compressionMethod: compressionMethod,
-                        localHeaderOffset: localHeaderOffset,
-                        crc32: crc32
-                    )
+            var totalUncompressedSize: UInt64 = 0
+            for _ in 0..<totalEntries {
+                guard offset + 46 <= cdData.count,
+                      cdData.readUInt32LE(at: offset) == 0x02014B50,
+                      let compressionMethod = cdData.readUInt16LE(at: offset + 10),
+                      let crc32 = cdData.readUInt32LE(at: offset + 16),
+                      let compressedSize = cdData.readUInt32LE(at: offset + 20),
+                      let uncompressedSize = cdData.readUInt32LE(at: offset + 24),
+                      let filenameLength = cdData.readUInt16LE(at: offset + 28),
+                      let extraLength = cdData.readUInt16LE(at: offset + 30),
+                      let commentLength = cdData.readUInt16LE(at: offset + 32),
+                      let localHeaderOffset = cdData.readUInt32LE(at: offset + 42) else {
+                    handle.closeFile()
+                    return nil
                 }
-                
-                entries.append(entry)
-                
-                let filenameLen = cdData.withUnsafeBytes { ptr in
-                    ptr.load(fromByteOffset: offset + 28, as: UInt16.self).littleEndian
+
+                let filenameByteCount = Int(filenameLength)
+                let extraByteCount = Int(extraLength)
+                let commentByteCount = Int(commentLength)
+                let entryLength = 46 + filenameByteCount + extraByteCount + commentByteCount
+                guard offset + entryLength <= cdData.count else {
+                    handle.closeFile()
+                    return nil
                 }
-                let extraLen = cdData.withUnsafeBytes { ptr in
-                    ptr.load(fromByteOffset: offset + 30, as: UInt16.self).littleEndian
+
+                let filenameStart = offset + 46
+                let filenameEnd = filenameStart + Int(filenameLength)
+                let filenameData = Data(cdData[filenameStart..<filenameEnd])
+                guard let filename = String(data: filenameData, encoding: .utf8), !filename.isEmpty else {
+                    handle.closeFile()
+                    return nil
                 }
-                let commentLen = cdData.withUnsafeBytes { ptr in
-                    ptr.load(fromByteOffset: offset + 32, as: UInt16.self).littleEndian
+
+                let entryUncompressedSize = UInt64(uncompressedSize)
+                guard entryUncompressedSize <= Self.maximumEntrySize,
+                      totalUncompressedSize <= Self.maximumTotalUncompressedSize - entryUncompressedSize else {
+                    handle.closeFile()
+                    return nil
                 }
-                offset += 46 + Int(filenameLen) + Int(extraLen) + Int(commentLen)
+                totalUncompressedSize += entryUncompressedSize
+
+                entries.append(Entry(
+                    filename: filename,
+                    compressedSize: compressedSize,
+                    uncompressedSize: uncompressedSize,
+                    compressionMethod: compressionMethod,
+                    localHeaderOffset: localHeaderOffset,
+                    crc32: crc32
+                ))
+                offset += entryLength
+            }
+
+            guard entries.count == Int(totalEntries) else {
+                handle.closeFile()
+                return nil
             }
         } catch {
             handle.closeFile()
@@ -527,48 +559,64 @@ private class Archive {
             if entry.filename.hasSuffix("/") || entry.filename.hasPrefix("__MACOSX") || entry.filename.contains("/__MACOSX") {
                 continue
             }
-            
-            let targetURL = destinationURL.appendingPathComponent(entry.filename)
-            
+
+            guard let targetURL = containedFileURL(baseURL: destinationURL, relativePath: entry.filename) else {
+                throw ParserError.parseFailed
+            }
+
             // 创建父目录
             let parentDir = targetURL.deletingLastPathComponent()
             try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
-            
+
             // 读取 Local File Header 获取实际数据偏移
             try fileHandle.seek(toOffset: UInt64(entry.localHeaderOffset))
-            let localHeader = fileHandle.readData(upToCount: 30)
-            guard localHeader.count >= 30 else { continue }
-            
-            let localFilenameLen = localHeader.withUnsafeBytes { $0.load(fromByteOffset: 26, as: UInt16.self) }.littleEndian
-            let localExtraLen = localHeader.withUnsafeBytes { $0.load(fromByteOffset: 28, as: UInt16.self) }.littleEndian
+            let localHeader = fileHandle.readData(ofLength: 30)
+            guard localHeader.count == 30,
+                  localHeader.readUInt32LE(at: 0) == 0x04034B50,
+                  let localFilenameLen = localHeader.readUInt16LE(at: 26),
+                  let localExtraLen = localHeader.readUInt16LE(at: 28) else {
+                throw ParserError.parseFailed
+            }
+
             let dataOffset = UInt64(entry.localHeaderOffset) + 30 + UInt64(localFilenameLen) + UInt64(localExtraLen)
-            
+            guard dataOffset <= fileSize,
+                  UInt64(entry.compressedSize) <= fileSize - dataOffset else {
+                throw ParserError.parseFailed
+            }
+
             try fileHandle.seek(toOffset: dataOffset)
-            let compressedData = fileHandle.readData(upToCount: Int(entry.compressedSize))
-            
+            let compressedData = fileHandle.readData(ofLength: Int(entry.compressedSize))
+            guard compressedData.count == Int(entry.compressedSize) else {
+                throw ParserError.parseFailed
+            }
+
             let decompressedData: Data
             switch entry.compressionMethod {
             case 0: // STORE
+                guard entry.compressedSize == entry.uncompressedSize else {
+                    throw ParserError.parseFailed
+                }
                 decompressedData = compressedData
             case 8: // DEFLATE
-                decompressedData = inflateDeflateData(compressedData, expectedSize: Int(entry.uncompressedSize))
+                decompressedData = try inflateDeflateData(compressedData, expectedSize: Int(entry.uncompressedSize))
             default:
-                continue
+                throw ParserError.parseFailed
             }
-            
-            try decompressedData.write(to: targetURL)
+
+            try decompressedData.write(to: targetURL, options: [.atomic, .withoutOverwriting])
         }
     }
-    
+
     /// 使用 Compression 框架的 compression_decode_buffer 解压 raw DEFLATE 数据
-    private func inflateDeflateData(_ compressedData: Data, expectedSize: Int) -> Data {
-        // 预分配输出缓冲区（预估大小为压缩数据的 4 倍，至少 expectedSize）
-        let estimatedSize = max(expectedSize, compressedData.count * 4)
-        var outputBuffer = [UInt8](repeating: 0, count: estimatedSize)
-        
+    private func inflateDeflateData(_ compressedData: Data, expectedSize: Int) throws -> Data {
+        guard expectedSize >= 0 else { throw ParserError.parseFailed }
+        if expectedSize == 0 { return Data() }
+
+        var outputBuffer = [UInt8](repeating: 0, count: expectedSize)
+
         let decodedSize = compressedData.withUnsafeBytes { srcPtr -> Int in
             outputBuffer.withUnsafeMutableBufferPointer { dstPtr in
-                return compression_decode_buffer(
+                compression_decode_buffer(
                     dstPtr.baseAddress!,
                     dstPtr.count,
                     srcPtr.baseAddress!.assumingMemoryBound(to: UInt8.self),
@@ -578,9 +626,9 @@ private class Archive {
                 )
             }
         }
-        
-        guard decodedSize > 0 else { return Data() }
-        return Data(outputBuffer.prefix(decodedSize))
+
+        guard decodedSize == expectedSize else { throw ParserError.parseFailed }
+        return Data(outputBuffer)
     }
     
     deinit {
@@ -589,21 +637,12 @@ private class Archive {
     
     // MARK: - 辅助
     
-    private struct EOCDRecord {
-        let totalEntries: UInt16
-        let centralDirectorySize: UInt32
-        let centralDirectoryOffset: UInt32
-    }
-    
-    private enum AccessMode {
-        case read
-    }
-    
     /// 在文件尾部数据中查找 End of Central Directory Record
-    private func findEOCD(in tailData: Data, totalSize: UInt64) -> Int? {
+    private static func findEOCD(in tailData: Data) -> Int? {
+        guard tailData.count >= 22 else { return nil }
         let signature: [UInt8] = [0x50, 0x4B, 0x05, 0x06]
         let tailBytes = [UInt8](tailData)
-        
+
         for i in stride(from: tailBytes.count - 22, through: 0, by: -1) {
             if i + 4 <= tailBytes.count {
                 if tailBytes[i] == signature[0] &&
@@ -615,5 +654,20 @@ private class Archive {
             }
         }
         return nil
+    }
+}
+
+private extension Data {
+    func readUInt16LE(at offset: Int) -> UInt16? {
+        guard offset >= startIndex, offset + 2 <= endIndex else { return nil }
+        return UInt16(self[offset]) | (UInt16(self[offset + 1]) << 8)
+    }
+
+    func readUInt32LE(at offset: Int) -> UInt32? {
+        guard offset >= startIndex, offset + 4 <= endIndex else { return nil }
+        return UInt32(self[offset])
+            | (UInt32(self[offset + 1]) << 8)
+            | (UInt32(self[offset + 2]) << 16)
+            | (UInt32(self[offset + 3]) << 24)
     }
 }

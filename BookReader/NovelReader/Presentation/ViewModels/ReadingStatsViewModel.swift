@@ -20,10 +20,7 @@ class ReadingStatsViewModel: ObservableObject {
         isLoading = true
         error = nil
         
-        let statsPublisher = repository.getAllBookStats()
-        let summaryPublisher = repository.getReadingStatsSummary()
-        
-        Publishers.Zip(statsPublisher, summaryPublisher)
+        repository.getDashboardStats()
             .receive(on: DispatchQueue.main)
             .sink(
                 receiveCompletion: { [weak self] completion in
@@ -32,9 +29,9 @@ class ReadingStatsViewModel: ObservableObject {
                         self?.error = error
                     }
                 },
-                receiveValue: { [weak self] stats, summary in
-                    self?.bookStats = stats
-                    self?.summary = summary
+                receiveValue: { [weak self] dashboard in
+                    self?.bookStats = dashboard.bookStats
+                    self?.summary = dashboard.summary
                 }
             )
             .store(in: &cancellables)

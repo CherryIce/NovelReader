@@ -26,6 +26,9 @@ protocol ReadingStatsRepositoryProtocol {
     
     /// 获取阅读统计摘要
     func getReadingStatsSummary() -> AnyPublisher<ReadingStatsSummary, Error>
+
+    /// 一次查询返回统计页需要的全部数据
+    func getDashboardStats() -> AnyPublisher<ReadingStatsDashboard, Error>
     
     /// 删除指定书籍的所有阅读记录
     func deleteSessions(forBookId bookId: UUID) -> AnyPublisher<Void, Error>

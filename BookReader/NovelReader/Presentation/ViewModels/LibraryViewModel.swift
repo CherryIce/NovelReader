@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import OSLog
 
 enum LibraryFilter: String, CaseIterable, Identifiable {
     case all
@@ -53,19 +54,18 @@ class LibraryViewModel: ObservableObject {
     @Published var batchImportFailedTitles: [String] = []
 
     private let bookRepository: BookRepositoryProtocol
-    private let chapterRepository: ChapterRepositoryProtocol
     private let txtParser = TXTParser()
     private let epubParser = EPUBParser()
     private let pdfParser = PDFParser()
     private var cancellables = Set<AnyCancellable>()
     private var booksRequestCancellable: AnyCancellable?
+    private let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.freedom.Configures.BookReader",
+        category: "BookImport"
+    )
 
-    init(
-        bookRepository: BookRepositoryProtocol = BookRepository(),
-        chapterRepository: ChapterRepositoryProtocol = ChapterRepository()
-    ) {
+    init(bookRepository: BookRepositoryProtocol = BookRepository()) {
         self.bookRepository = bookRepository
-        self.chapterRepository = chapterRepository
     }
 
     /// 加载书籍列表
@@ -135,78 +135,65 @@ class LibraryViewModel: ObservableObject {
 
     /// 导入书籍
     func importBook(from url: URL) {
-        let ext = url.pathExtension.lowercased()
-        guard ["txt", "epub", "pdf"].contains(ext) || ext.isEmpty else {
+        guard !isImporting, !isBatchImporting else { return }
+        guard isSupportedBookURL(url) else {
             error = .parseFailed
             return
         }
 
-        // 重置导入状态
         importSuccess = false
         importedBookTitle = ""
-
-        // 从文件名提取书籍名称（去掉扩展名）
-        let bookName = url.deletingPathExtension().lastPathComponent
-        importingBookTitle = bookName
-
-        // 开始导入，显示进度
+        importingBookTitle = url.deletingPathExtension().lastPathComponent
         isImporting = true
         importProgress = "正在检查..."
+        logger.notice("Import selected: \(url.lastPathComponent, privacy: .public)")
 
-        // 启动安全作用域访问（.open 模式需要）
-        let accessing = url.startAccessingSecurityScopedResource()
-
-        // 检查是否已存在相同文件名的书籍
-        let fileName = url.lastPathComponent
         bookRepository.getAllBooks()
             .receive(on: DispatchQueue.main)
             .sink(
                 receiveCompletion: { [weak self] completion in
                     guard case .failure(let error) = completion else { return }
-                    if accessing {
-                        url.stopAccessingSecurityScopedResource()
-                    }
                     self?.isImporting = false
                     self?.importingBookTitle = ""
                     self?.error = self?.userFacingError(from: error)
                 },
                 receiveValue: { [weak self] books in
-                    guard let self = self else {
-                        if accessing {
-                            url.stopAccessingSecurityScopedResource()
-                        }
-                        return
-                    }
-
-                    // 检查是否已存在相同文件名的书籍
-                    let existingBook = books.first { book in
-                        let bookFileName = URL(fileURLWithPath: book.filePath).lastPathComponent
-                        return bookFileName == fileName
-                    }
-
-                    if existingBook != nil {
-                        // 书籍已存在，提示用户
+                    guard let self else { return }
+                    if self.containsFilename(url.lastPathComponent, in: books) {
                         self.isImporting = false
                         self.importingBookTitle = ""
-                        if accessing {
-                            url.stopAccessingSecurityScopedResource()
-                        }
                         self.error = .bookAlreadyExists
+                        self.logger.notice("Import rejected as duplicate: \(url.lastPathComponent, privacy: .public)")
                         return
                     }
 
-                    // 继续导入流程（安全作用域由 continueImportBook 统一管理）
-                    self.continueImportBook(from: url, accessing: accessing)
+                    self.performImport(from: url, removesSourceWhenFinished: false) { [weak self] result in
+                        guard let self else { return }
+
+                        switch result {
+                        case .success(let book):
+                            self.publishImportedBooks([book])
+                            self.importSuccess = true
+                            self.importedBookTitle = book.title
+                            self.logger.notice("Import committed: \(book.title, privacy: .public)")
+                        case .failure(let message):
+                            self.error = .operationFailed(message: message)
+                            self.logger.error("Import failed: \(message, privacy: .public)")
+                        }
+
+                        self.isImporting = false
+                        self.importingBookTitle = ""
+                        self.importProgress = ""
+                    }
                 }
             )
             .store(in: &cancellables)
     }
 
     /// 批量导入书籍
-    func importBooks(from urls: [URL]) {
-        guard !urls.isEmpty else { return }
+    func importBooks(from urls: [URL], removesSourceWhenFinished: Bool = false) {
+        guard !urls.isEmpty, !isImporting, !isBatchImporting else { return }
 
-        // 重置批量导入状态
         batchImportSuccess = false
         batchImportSuccessCount = 0
         batchImportFailCount = 0
@@ -215,255 +202,171 @@ class LibraryViewModel: ObservableObject {
         batchImportCurrent = 0
         isBatchImporting = true
         batchImportProgress = "正在检查 \(urls.count) 个文件..."
+        logger.notice("Batch import selected: \(urls.count) files")
 
-        // 启动所有文件的安全作用域访问
-        var accessTokens: [(url: URL, accessing: Bool)] = []
-        for url in urls {
-            let accessing = url.startAccessingSecurityScopedResource()
-            accessTokens.append((url: url, accessing: accessing))
-        }
-
-        // 先获取已有书籍列表用于去重
         bookRepository.getAllBooks()
             .receive(on: DispatchQueue.main)
             .sink(
-                receiveCompletion: { _ in },
+                receiveCompletion: { [weak self] completion in
+                    guard case .failure(let error) = completion else { return }
+                    guard let self else { return }
+                    self.isBatchImporting = false
+                    self.batchImportProgress = ""
+                    self.cleanupSourcesIfNeeded(urls, enabled: removesSourceWhenFinished)
+                    self.error = self.userFacingError(from: error)
+                },
                 receiveValue: { [weak self] existingBooks in
-                    guard let self = self else { return }
+                    guard let self else { return }
 
-                    let existingFileNames = Set(existingBooks.map { book in
-                        URL(fileURLWithPath: book.filePath).lastPathComponent
+                    var seenFilenames = Set(existingBooks.map {
+                        URL(fileURLWithPath: $0.filePath).lastPathComponent.lowercased()
                     })
+                    var urlsToImport: [URL] = []
+                    var initialFailures: [String] = []
 
-                    // 过滤掉已存在的文件
-                    let urlsToImport = accessTokens.filter { token in
-                        let fileName = token.url.lastPathComponent
-                        return !existingFileNames.contains(fileName)
-                    }.map { $0.url }
-
-                    // 释放不需要导入的文件的安全作用域
-                    for token in accessTokens {
-                        if !urlsToImport.contains(token.url) && token.accessing {
-                            token.url.stopAccessingSecurityScopedResource()
+                    for url in urls {
+                        let filename = url.lastPathComponent
+                        let key = filename.lowercased()
+                        guard self.isSupportedBookURL(url), seenFilenames.insert(key).inserted else {
+                            initialFailures.append("\(filename): 格式不支持或书籍已存在")
+                            if removesSourceWhenFinished {
+                                self.cleanupSource(url)
+                            }
+                            continue
                         }
+                        urlsToImport.append(url)
                     }
 
                     if urlsToImport.isEmpty {
-                        self.isBatchImporting = false
-                        self.batchImportProgress = ""
-                        self.error = .bookAlreadyExists
+                        self.finishBatchImport(
+                            successCount: 0,
+                            failedTitles: initialFailures,
+                            importedBooks: []
+                        )
                         return
                     }
 
                     self.batchImportTotal = urlsToImport.count
                     self.batchImportCurrent = 0
                     self.batchImportProgress = "准备导入 \(urlsToImport.count) 个文件..."
-
-                    // 在后台线程逐个导入
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        self.processBatchImport(urls: urlsToImport)
-                    }
+                    self.processBatchImport(
+                        urls: urlsToImport,
+                        index: 0,
+                        successCount: 0,
+                        failedTitles: initialFailures,
+                        importedBooks: [],
+                        removesSourceWhenFinished: removesSourceWhenFinished
+                    )
                 }
             )
             .store(in: &cancellables)
     }
 
-    /// 处理批量导入（在后台线程执行）
-    private func processBatchImport(urls: [URL]) {
-        var successCount = 0
-        var failCount = 0
-        var failedTitles: [String] = []
-
-        for (index, url) in urls.enumerated() {
-            let bookName = url.deletingPathExtension().lastPathComponent
-
-            DispatchQueue.main.async {
-                self.batchImportCurrent = index + 1
-                self.batchImportProgress = "正在导入 (\(index + 1)/\(urls.count)): \(bookName)"
-                self.importingBookTitle = bookName
-            }
-
-            let result = importSingleBook(from: url)
-
-            switch result {
-            case .success:
-                successCount += 1
-            case .failure(let title):
-                failCount += 1
-                failedTitles.append(title)
-            }
-        }
-
-        DispatchQueue.main.async {
-            self.isBatchImporting = false
-            self.batchImportProgress = ""
-            self.importingBookTitle = ""
-            self.batchImportSuccess = true
-            self.batchImportSuccessCount = successCount
-            self.batchImportFailCount = failCount
-            self.batchImportFailedTitles = failedTitles
-            self.loadBooks()
-        }
-    }
-
-    /// 导入单个书籍（同步方法，用于批量导入）
     private enum ImportResult {
-        case success
+        case success(Book)
         case failure(String)
     }
 
-    private func importSingleBook(from url: URL) -> ImportResult {
-        let ext = url.pathExtension.lowercased()
-        guard ["txt", "epub", "pdf"].contains(ext) || ext.isEmpty else {
-            return .failure(url.lastPathComponent)
-        }
-
-        let accessing = url.startAccessingSecurityScopedResource()
-        defer {
-            if accessing {
-                url.stopAccessingSecurityScopedResource()
-            }
-        }
-
-        do {
-            // 解析书籍
-            let parsedBook: ParsedBook
-            switch ext {
-            case "epub":
-                parsedBook = try epubParser.parse(fileURL: url)
-            case "pdf":
-                parsedBook = try pdfParser.parse(fileURL: url)
-            default:
-                parsedBook = try txtParser.parse(fileURL: url)
-            }
-
-            // 复制到 Documents 目录
-            let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-            let booksDir = documentsDir.appendingPathComponent("Books")
-            try? FileManager.default.createDirectory(at: booksDir, withIntermediateDirectories: true)
-
-            let destinationURL = booksDir.appendingPathComponent(url.lastPathComponent)
-            if FileManager.default.fileExists(atPath: destinationURL.path) {
-                try? FileManager.default.removeItem(at: destinationURL)
-            }
-            try FileManager.default.copyItem(at: url, to: destinationURL)
-
-            // 创建书籍实体
-            let fileSize = (try? FileManager.default.attributesOfItem(atPath: destinationURL.path)[.size] as? Int64) ?? 0
-            let book = Book(
-                title: parsedBook.title,
-                author: parsedBook.author,
-                filePath: destinationURL.path,
-                format: parsedBook.format,
-                fileSize: fileSize
+    private func processBatchImport(
+        urls: [URL],
+        index: Int,
+        successCount: Int,
+        failedTitles: [String],
+        importedBooks: [Book],
+        removesSourceWhenFinished: Bool
+    ) {
+        guard index < urls.count else {
+            finishBatchImport(
+                successCount: successCount,
+                failedTitles: failedTitles,
+                importedBooks: importedBooks
             )
+            return
+        }
 
-            let chapters = parsedBook.chapters.map { parsedChapter in
-                Chapter(
-                    index: parsedChapter.index,
-                    title: parsedChapter.title,
-                    content: parsedChapter.content,
-                    startLocation: parsedChapter.startLocation,
-                    length: parsedChapter.length
-                )
+        let url = urls[index]
+        batchImportCurrent = index + 1
+        batchImportProgress = "正在导入 (\(index + 1)/\(urls.count)): \(url.deletingPathExtension().lastPathComponent)"
+        importingBookTitle = url.deletingPathExtension().lastPathComponent
+
+        performImport(from: url, removesSourceWhenFinished: removesSourceWhenFinished) { [weak self] result in
+            guard let self else { return }
+            var nextSuccessCount = successCount
+            var nextFailedTitles = failedTitles
+            var nextImportedBooks = importedBooks
+            switch result {
+            case .success(let book):
+                nextSuccessCount += 1
+                nextImportedBooks.append(book)
+            case .failure(let message):
+                nextFailedTitles.append(message)
             }
 
-            // 保存书籍和章节；批量导入在后台串行等待当前文件完成。
-            let semaphore = DispatchSemaphore(value: 0)
-            var saveError: Error?
-
-            DispatchQueue.main.async {
-                self.bookRepository.addBook(book)
-                    .flatMap { _ in
-                        self.chapterRepository.saveChapters(chapters, forBookId: book.id)
-                            .map { book }
-                            .eraseToAnyPublisher()
-                    }
-                    .receive(on: DispatchQueue.main)
-                    .sink(
-                        receiveCompletion: { completion in
-                            if case .failure(let error) = completion {
-                                saveError = error
-                            }
-                            semaphore.signal()
-                        },
-                        receiveValue: { _ in }
-                    )
-                    .store(in: &self.cancellables)
-            }
-
-            semaphore.wait()
-
-            if let saveError = saveError {
-                return .failure("\(url.lastPathComponent): \(saveError.localizedDescription)")
-            }
-
-            return .success
-        } catch {
-            return .failure("\(url.lastPathComponent): \(error.localizedDescription)")
+            self.processBatchImport(
+                urls: urls,
+                index: index + 1,
+                successCount: nextSuccessCount,
+                failedTitles: nextFailedTitles,
+                importedBooks: nextImportedBooks,
+                removesSourceWhenFinished: removesSourceWhenFinished
+            )
         }
     }
 
-    /// 继续导入书籍（去重检查通过后）
-    private func continueImportBook(from url: URL, accessing: Bool) {
-        // 在后台线程执行耗时操作
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else {
-                if accessing {
-                    url.stopAccessingSecurityScopedResource()
-                }
-                return
-            }
+    private func finishBatchImport(
+        successCount: Int,
+        failedTitles: [String],
+        importedBooks: [Book]
+    ) {
+        publishImportedBooks(importedBooks)
+        isBatchImporting = false
+        batchImportProgress = ""
+        importingBookTitle = ""
+        batchImportSuccess = true
+        batchImportSuccessCount = successCount
+        batchImportFailCount = failedTitles.count
+        batchImportFailedTitles = failedTitles
+        logger.notice("Batch import finished: \(successCount) succeeded, \(failedTitles.count) failed")
+    }
 
-            // 确保安全作用域访问被释放
-            defer {
-                if accessing {
-                    url.stopAccessingSecurityScopedResource()
-                }
-            }
+    private func performImport(
+        from url: URL,
+        removesSourceWhenFinished: Bool,
+        completion: @escaping (ImportResult) -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let accessing = url.startAccessingSecurityScopedResource()
 
             do {
-                // 更新进度：解析文件
                 DispatchQueue.main.async {
                     self.importProgress = "正在解析文件..."
+                    self.logger.debug("Parsing: \(url.lastPathComponent, privacy: .public)")
                 }
 
-                // 解析书籍（根据格式选择解析器）
-                let parsedBook: ParsedBook
-                let fileExt = url.pathExtension.lowercased()
-                switch fileExt {
-                case "epub":
-                    parsedBook = try self.epubParser.parse(fileURL: url)
-                case "pdf":
-                    parsedBook = try self.pdfParser.parse(fileURL: url)
-                default:
-                    parsedBook = try self.txtParser.parse(fileURL: url)
-                }
+                let parsedBook = try self.parseBook(at: url)
 
-                // 更新进度：复制文件
                 DispatchQueue.main.async {
                     self.importProgress = "正在复制文件..."
+                    self.logger.debug("Copying: \(url.lastPathComponent, privacy: .public)")
                 }
 
-                // 复制到Documents目录
-                let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+                guard let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+                    throw BookError.fileNotAccessible
+                }
                 let booksDir = documentsDir.appendingPathComponent("Books")
                 try FileManager.default.createDirectory(at: booksDir, withIntermediateDirectories: true)
-
                 let destinationURL = booksDir.appendingPathComponent(url.lastPathComponent)
-
-                // 防止覆盖孤立文件或并发导入生成的同名文件
                 if FileManager.default.fileExists(atPath: destinationURL.path) {
                     throw BookError.bookAlreadyExists
                 }
                 try FileManager.default.copyItem(at: url, to: destinationURL)
 
-                // 更新进度：保存到数据库
                 DispatchQueue.main.async {
                     self.importProgress = "正在保存..."
+                    self.logger.debug("Saving: \(url.lastPathComponent, privacy: .public)")
                 }
 
-                // 创建书籍实体
                 let fileSize = (try? FileManager.default.attributesOfItem(atPath: destinationURL.path)[.size] as? Int64) ?? 0
                 let book = Book(
                     title: parsedBook.title,
@@ -472,7 +375,6 @@ class LibraryViewModel: ObservableObject {
                     format: parsedBook.format,
                     fileSize: fileSize
                 )
-
                 let chapters = parsedBook.chapters.map { parsedChapter in
                     Chapter(
                         index: parsedChapter.index,
@@ -483,71 +385,110 @@ class LibraryViewModel: ObservableObject {
                     )
                 }
 
-                let bookRepository = self.bookRepository
-                let chapterRepository = self.chapterRepository
-
-                // 串联保存书籍和章节；Repository 使用后台 context 执行 Core Data 操作
                 DispatchQueue.main.async {
-                    bookRepository.addBook(book)
-                        .flatMap { _ in
-                            chapterRepository.saveChapters(chapters, forBookId: book.id)
-                                .map { book }
-                                .eraseToAnyPublisher()
-                        }
+                    if accessing {
+                        url.stopAccessingSecurityScopedResource()
+                    }
+
+                    self.bookRepository.addBook(book, chapters: chapters)
                         .receive(on: DispatchQueue.main)
                         .sink(
-                            receiveCompletion: { [weak self] completion in
-                                if case .failure(let error) = completion {
-                                    guard let self = self else { return }
-                                    var failureMessage = self.userFacingError(from: error).localizedDescription
-                                    if FileManager.default.fileExists(atPath: destinationURL.path) {
-                                        do {
-                                            try FileManager.default.removeItem(at: destinationURL)
-                                        } catch {
-                                            failureMessage += "；临时文件清理失败：\(error.localizedDescription)"
-                                        }
-                                    }
-                                    self.isImporting = false
-                                    self.importingBookTitle = ""
-                                    self.error = .operationFailed(message: failureMessage)
-                                    bookRepository.deleteBook(byId: book.id)
-                                        .receive(on: DispatchQueue.main)
-                                        .sink(
-                                            receiveCompletion: { [weak self] rollbackCompletion in
-                                                guard let self = self else { return }
-                                                guard case .failure(let rollbackError) = rollbackCompletion,
-                                                      !self.isMissingRollbackRecord(rollbackError) else {
-                                                    return
-                                                }
-                                                self.error = .operationFailed(
-                                                    message: "\(failureMessage)；数据库回滚失败：\(rollbackError.localizedDescription)"
-                                                )
-                                            },
-                                            receiveValue: { _ in }
-                                        )
-                                        .store(in: &self.cancellables)
-                                }
+                            receiveCompletion: { [weak self] publisherCompletion in
+                                guard case .failure(let error) = publisherCompletion else { return }
+                                try? FileManager.default.removeItem(at: destinationURL)
+                                self?.cleanupSourceIfNeeded(url, enabled: removesSourceWhenFinished)
+                                completion(.failure("\(url.lastPathComponent): \(error.localizedDescription)"))
                             },
-                            receiveValue: { [weak self] _ in
-                                guard let self = self else { return }
-                                self.isImporting = false
-                                self.importingBookTitle = ""
-                                self.importSuccess = true
-                                self.importedBookTitle = book.title
-                                self.loadBooks()
+                            receiveValue: { [weak self] savedBook in
+                                self?.cleanupSourceIfNeeded(url, enabled: removesSourceWhenFinished)
+                                completion(.success(savedBook))
                             }
                         )
                         .store(in: &self.cancellables)
                 }
-
             } catch {
                 DispatchQueue.main.async {
-                    self.isImporting = false
-                    self.importingBookTitle = ""
-                    self.error = self.userFacingError(from: error)
+                    if accessing {
+                        url.stopAccessingSecurityScopedResource()
+                    }
+                    self.cleanupSourceIfNeeded(url, enabled: removesSourceWhenFinished)
+                    completion(.failure("\(url.lastPathComponent): \(error.localizedDescription)"))
                 }
             }
         }
+    }
+
+    private func parseBook(at url: URL) throws -> ParsedBook {
+        switch url.pathExtension.lowercased() {
+        case "epub":
+            return try epubParser.parse(fileURL: url)
+        case "pdf":
+            return try pdfParser.parse(fileURL: url)
+        default:
+            return try txtParser.parse(fileURL: url)
+        }
+    }
+
+    private func isSupportedBookURL(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return ["txt", "epub", "pdf"].contains(ext) || ext.isEmpty
+    }
+
+    private func containsFilename(_ filename: String, in books: [Book]) -> Bool {
+        books.contains {
+            URL(fileURLWithPath: $0.filePath).lastPathComponent.caseInsensitiveCompare(filename) == .orderedSame
+        }
+    }
+
+    private func publishImportedBooks(_ importedBooks: [Book]) {
+        guard !importedBooks.isEmpty else { return }
+
+        booksRequestCancellable?.cancel()
+        let importedIDs = Set(importedBooks.map(\.id))
+        let importedPaths = Set(importedBooks.map(\.filePath))
+        var updatedBooks = books.filter {
+            !importedIDs.contains($0.id) && !importedPaths.contains($0.filePath)
+        }
+        let matchingBooks = applyCurrentFilter(to: importedBooks)
+            .filter(matchesCurrentSearch)
+            .sorted { $0.createdAt > $1.createdAt }
+        updatedBooks.insert(contentsOf: matchingBooks, at: 0)
+        books = updatedBooks
+    }
+
+    private func matchesCurrentSearch(_ book: Book) -> Bool {
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return true }
+        return book.title.localizedCaseInsensitiveContains(query)
+            || (book.author?.localizedCaseInsensitiveContains(query) ?? false)
+    }
+
+    private func cleanupSourcesIfNeeded(_ urls: [URL], enabled: Bool) {
+        guard enabled else { return }
+        urls.forEach(cleanupSource)
+    }
+
+    private func cleanupSourceIfNeeded(_ url: URL, enabled: Bool) {
+        guard enabled else { return }
+        cleanupSource(url)
+    }
+
+    private func cleanupSource(_ url: URL) {
+        let inboxRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BookReaderWiFiUploads", isDirectory: true)
+            .standardizedFileURL
+        let rootPrefix = inboxRoot.path.hasSuffix("/") ? inboxRoot.path : inboxRoot.path + "/"
+        let source = url.standardizedFileURL
+        guard source.path.hasPrefix(rootPrefix) else { return }
+
+        try? FileManager.default.removeItem(at: source)
+
+        let parent = source.deletingLastPathComponent()
+        guard parent.path.hasPrefix(rootPrefix),
+              (try? FileManager.default.contentsOfDirectory(atPath: parent.path).isEmpty) == true else {
+            return
+        }
+        try? FileManager.default.removeItem(at: parent)
     }
 
     /// 删除书籍（包括数据库记录、本地文件和缓存）
@@ -629,14 +570,6 @@ class LibraryViewModel: ObservableObject {
             return .operationFailed(message: parserError.localizedDescription)
         }
         return .operationFailed(message: error.localizedDescription)
-    }
-
-    private func isMissingRollbackRecord(_ error: Error) -> Bool {
-        guard let bookError = error as? BookError else { return false }
-        if case .notFound = bookError {
-            return true
-        }
-        return false
     }
 
     private func applyCurrentFilter(to books: [Book]) -> [Book] {
