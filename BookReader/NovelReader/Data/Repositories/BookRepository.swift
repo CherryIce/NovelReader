@@ -5,8 +5,9 @@ import Combine
 class BookRepository: BookRepositoryProtocol {
     private let context: NSManagedObjectContext
     
-    init(context: NSManagedObjectContext = PersistenceController.shared.container.viewContext) {
+    init(context: NSManagedObjectContext = PersistenceController.shared.container.newBackgroundContext()) {
         self.context = context
+        self.context.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
     }
     
     func getAllBooks() -> AnyPublisher<[Book], Error> {
@@ -155,7 +156,10 @@ class BookRepository: BookRepositoryProtocol {
         Future { promise in
             self.context.perform {
                 let request: NSFetchRequest<BookEntity> = BookEntity.fetchRequest()
-                request.predicate = NSPredicate(format: "lastReadAt != nil")
+                request.predicate = NSPredicate(
+                    format: "lastReadAt != nil AND readingStatus == %@",
+                    ReadingStatus.reading.rawValue
+                )
                 request.sortDescriptors = [NSSortDescriptor(key: "lastReadAt", ascending: false)]
                 request.fetchLimit = limit
                 
@@ -174,7 +178,8 @@ class BookRepository: BookRepositoryProtocol {
     func updateReadingProgress(
         bookId: UUID,
         chapterIndex: Int,
-        contentOffset: Int
+        contentOffset: Int,
+        isCompleted: Bool
     ) -> AnyPublisher<Void, Error> {
         Future { promise in
             self.context.perform {
@@ -186,7 +191,11 @@ class BookRepository: BookRepositoryProtocol {
                         entity.lastReadChapterIndex = Int32(chapterIndex)
                         entity.lastReadContentOffset = Int32(contentOffset)
                         entity.lastReadAt = Date()
-                        entity.readingStatus = ReadingStatus.reading.rawValue
+                        if isCompleted {
+                            entity.readingStatus = ReadingStatus.completed.rawValue
+                        } else if entity.readingStatus != ReadingStatus.completed.rawValue {
+                            entity.readingStatus = ReadingStatus.reading.rawValue
+                        }
                         try self.context.save()
                         promise(.success(()))
                     } else {

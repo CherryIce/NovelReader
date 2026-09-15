@@ -5,8 +5,9 @@ import Combine
 class BookmarkRepository: BookmarkRepositoryProtocol {
     private let context: NSManagedObjectContext
     
-    init(context: NSManagedObjectContext = PersistenceController.shared.container.viewContext) {
+    init(context: NSManagedObjectContext = PersistenceController.shared.container.newBackgroundContext()) {
         self.context = context
+        self.context.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
     }
     
     func getBookmarks(forBookId bookId: UUID) -> AnyPublisher<[Bookmark], Error> {

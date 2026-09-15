@@ -7,8 +7,6 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         // 初始化 NovelReader 服务
         ThemeService.shared.initialize()
         FontService.shared.initialize()
-        let documentsDirs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
-        print("🌹🌹🌹🌹\(documentsDirs.first)🌹🌹🌹🌹")
         return true
     }
 

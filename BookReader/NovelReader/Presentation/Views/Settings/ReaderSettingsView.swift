@@ -1,9 +1,17 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ReaderSettingsView: View {
+    let showsDoneButton: Bool
     @ObservedObject private var themeService = ThemeService.shared
     @ObservedObject private var fontService = FontService.shared
-    @Environment(\.presentationMode) var presentationMode
+    @Environment(\.dismiss) private var dismiss
+    @State private var showingFontPicker = false
+    @State private var fontImportFailed = false
+
+    init(showsDoneButton: Bool = true) {
+        self.showsDoneButton = showsDoneButton
+    }
     
     var body: some View {
         NavigationView {
@@ -47,7 +55,7 @@ struct ReaderSettingsView: View {
                     }
                     
                     Text("预览文字大小")
-                        .font(.system(size: themeService.fontSize))
+                        .font(readerFont)
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, 8)
                 }
@@ -74,13 +82,45 @@ struct ReaderSettingsView: View {
                             Text(font).tag(font)
                         }
                     }
+
+                    Button(action: { showingFontPicker = true }) {
+                        HStack {
+                            Image(systemName: "plus.circle")
+                            Text("导入 TTF/OTF 字体")
+                        }
+                    }
                 }
             }
             .navigationBarTitle("阅读设置", displayMode: .inline)
-            .navigationBarItems(trailing: Button("完成") {
-                presentationMode.wrappedValue.dismiss()
+            .navigationBarItems(trailing: Group {
+                if showsDoneButton {
+                    Button("完成") {
+                        dismiss()
+                    }
+                }
             })
+            .sheet(isPresented: $showingFontPicker) {
+                DocumentPicker(contentTypes: [.font]) { url in
+                    if !fontService.importFont(from: url) {
+                        fontImportFailed = true
+                    }
+                }
+            }
+            .alert(isPresented: $fontImportFailed) {
+                Alert(
+                    title: Text("字体导入失败"),
+                    message: Text("请选择有效且尚未导入的 TTF 或 OTF 字体文件。"),
+                    dismissButton: .default(Text("确定"))
+                )
+            }
         }
+    }
+
+    private var readerFont: Font {
+        if fontService.currentFont == "System" {
+            return .system(size: themeService.fontSize)
+        }
+        return .custom(fontService.currentFont, size: themeService.fontSize)
     }
 }
 

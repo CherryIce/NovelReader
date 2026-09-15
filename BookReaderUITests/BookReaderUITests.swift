@@ -23,12 +23,21 @@ final class BookReaderUITests: XCTestCase {
     }
 
     @MainActor
-    func testExample() throws {
-        // UI tests must launch the application that they test.
+    func testPrimaryTabsNavigate() throws {
         let app = XCUIApplication()
         app.launch()
 
-        // Use XCTAssert and related functions to verify your tests produce the correct results.
+        let tabBar = app.tabBars.firstMatch
+        XCTAssertTrue(tabBar.waitForExistence(timeout: 5))
+        XCTAssertTrue(tabBar.buttons["书架"].exists)
+        XCTAssertTrue(tabBar.buttons["搜索"].exists)
+        XCTAssertTrue(tabBar.buttons["设置"].exists)
+
+        tabBar.buttons["搜索"].tap()
+        XCTAssertTrue(app.navigationBars["搜索"].waitForExistence(timeout: 2))
+
+        tabBar.buttons["设置"].tap()
+        XCTAssertTrue(app.navigationBars["阅读设置"].waitForExistence(timeout: 2))
     }
 
     @MainActor

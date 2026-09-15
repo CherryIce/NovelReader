@@ -90,7 +90,7 @@ class ThemeService: ObservableObject {
     @Published var currentTheme: ReaderTheme = .light
     @Published var fontSize: CGFloat = 18
     @Published var lineSpacing: CGFloat = 8
-    @Published var paragraphSpacing: CGFloat = 16
+    @Published var paragraphSpacing: CGFloat = 0
     @Published var pageMargins: EdgeInsets = EdgeInsets(top: 20, leading: 20, bottom: 20, trailing: 20)
     
     private let userDefaults = UserDefaults.standard
@@ -113,15 +113,13 @@ class ThemeService: ObservableObject {
         }
         
         // 加载字体大小
-        let savedFontSize = userDefaults.double(forKey: kFontSizeKey)
-        if savedFontSize > 0 {
-            fontSize = CGFloat(savedFontSize)
+        if userDefaults.object(forKey: kFontSizeKey) != nil {
+            fontSize = CGFloat(userDefaults.double(forKey: kFontSizeKey))
         }
         
         // 加载行间距
-        let savedLineSpacing = userDefaults.double(forKey: kLineSpacingKey)
-        if savedLineSpacing > 0 {
-            lineSpacing = CGFloat(savedLineSpacing)
+        if userDefaults.object(forKey: kLineSpacingKey) != nil {
+            lineSpacing = CGFloat(userDefaults.double(forKey: kLineSpacingKey))
         }
     }
     

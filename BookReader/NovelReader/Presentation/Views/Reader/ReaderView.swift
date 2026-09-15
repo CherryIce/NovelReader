@@ -3,7 +3,7 @@ import UIKit
 
 struct ReaderView: View {
     @ObservedObject private var viewModel: ReaderViewModel
-    @Environment(\.presentationMode) var presentationMode
+    @Environment(\.dismiss) private var dismiss
     @ObservedObject private var themeService = ThemeService.shared
     
     init(book: Book) {
@@ -11,18 +11,25 @@ struct ReaderView: View {
     }
     
     var body: some View {
-        ZStack {
-            // 背景层 - 延伸到安全区域
-            themeService.currentTheme.backgroundColor
-                .edgesIgnoringSafeArea(.all)
-            
-            // 内容层 - 始终占满全屏
-            contentLayer
-            
-            // 工具栏层 - 覆盖在内容上方
-            if viewModel.showToolbar {
-                toolbarLayer
-                    .transition(.opacity)
+        GeometryReader { geometry in
+            ZStack {
+                // 背景层 - 延伸到安全区域
+                themeService.currentTheme.backgroundColor
+                    .ignoresSafeArea()
+
+                // 内容层 - 始终占满全屏
+                contentLayer
+
+                // 工具栏层 - 覆盖在内容上方
+                if viewModel.showToolbar {
+                    toolbarLayer
+                        .transition(.opacity)
+                }
+            }
+            .onAppear {
+                // 首次加载前先提供真实尺寸，避免先按屏幕估算分页后再重排。
+                viewModel.setAvailableViewSize(geometry.size)
+                viewModel.loadBook()
             }
         }
         .statusBar(hidden: !viewModel.showToolbar)
@@ -59,9 +66,6 @@ struct ReaderView: View {
                 }
             )
         }
-        .onAppear {
-            viewModel.loadBook()
-        }
     }
     
     // MARK: - 内容层
@@ -82,9 +86,10 @@ struct ReaderView: View {
     private var loadingView: some View {
         ZStack {
             themeService.currentTheme.backgroundColor
-                .edgesIgnoringSafeArea(.all)
+                .ignoresSafeArea()
             VStack(spacing: 16) {
-                ActivityIndicator(isAnimating: true, style: .large)
+                ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle())
                     .scaleEffect(1.5)
                 Text("正在加载书籍...")
                     .font(.subheadline)
@@ -96,7 +101,7 @@ struct ReaderView: View {
     private func errorView(error: BookError) -> some View {
         ZStack {
             themeService.currentTheme.backgroundColor
-                .edgesIgnoringSafeArea(.all)
+                .ignoresSafeArea()
             VStack(spacing: 16) {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.system(size: 50))
@@ -110,7 +115,7 @@ struct ReaderView: View {
                 
                 HStack(spacing: 16) {
                     Button("返回书架") {
-                        presentationMode.wrappedValue.dismiss()
+                        dismiss()
                     }
                     .padding(.horizontal, 24)
                     .padding(.vertical, 8)
@@ -135,7 +140,7 @@ struct ReaderView: View {
     private var emptyView: some View {
         ZStack {
             themeService.currentTheme.backgroundColor
-                .edgesIgnoringSafeArea(.all)
+                .ignoresSafeArea()
             VStack(spacing: 16) {
                 Image(systemName: "doc.text")
                     .font(.system(size: 50))
@@ -161,8 +166,8 @@ struct ReaderView: View {
                 }
             )
             .onAppear {
-                // 将实际可用的视图高度传递给 ViewModel，用于精确分页
-                viewModel.setAvailableViewHeight(geometry.size.height)
+                // 将实际可用的视图尺寸传递给 ViewModel，用于精确分页
+                viewModel.setAvailableViewSize(geometry.size)
             }
         }
     }
@@ -174,7 +179,7 @@ struct ReaderView: View {
             // 顶部工具栏
             ReaderTopToolbar(
                 title: viewModel.currentPage?.chapterTitle ?? viewModel.book.title,
-                onBack: { presentationMode.wrappedValue.dismiss() },
+                onBack: { dismiss() },
                 onCatalog: { viewModel.showCatalog = true },
                 onSettings: { viewModel.showSettings = true },
                 onBookmark: { viewModel.toggleBookmark() },
@@ -238,6 +243,7 @@ struct PageContentView: View {
     let pageIndex: Int
     @ObservedObject var viewModel: ReaderViewModel
     @ObservedObject private var themeService = ThemeService.shared
+    @ObservedObject private var fontService = FontService.shared
     
     private var theme: ReaderTheme {
         themeService.currentTheme
@@ -255,33 +261,44 @@ struct PageContentView: View {
             }
             .padding(.horizontal, 20)
             .padding(.top, 8)
-            .frame(height: 28, alignment: .top)
+            .frame(height: ReaderLayoutMetrics.headerHeight, alignment: .top)
             
             // 中间阅读内容 - 占据剩余空间
             GeometryReader { geometry in
                 Text(page.content)
-                    .font(.system(size: themeService.fontSize))
+                    .font(readerFont)
                     .foregroundColor(theme.textColor)
                     .lineSpacing(themeService.lineSpacing)
                     .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, maxHeight: geometry.size.height, alignment: .topLeading)
-                    .padding(.horizontal, 20)
-                    .padding(.top, 10)
+                    .padding(.horizontal, ReaderLayoutMetrics.horizontalPadding)
+                    .padding(.top, ReaderLayoutMetrics.contentTopPadding)
+                    .frame(
+                        width: geometry.size.width,
+                        height: geometry.size.height,
+                        alignment: .topLeading
+                    )
                     .clipped()
             }
             
             // 底部页码 - 固定高度区域
             HStack {
                 Spacer()
-                Text("\(viewModel.currentPageIndex + 1)/\(viewModel.totalPages)")
+                Text("\(pageIndex + 1)/\(viewModel.totalPages)")
                     .font(.caption)
                     .foregroundColor(theme.secondaryTextColor)
                     .padding(.trailing, 20)
                     .padding(.bottom, 12)
             }
-            .frame(height: 30, alignment: .bottom)
+            .frame(height: ReaderLayoutMetrics.footerHeight, alignment: .bottom)
         }
         .background(theme.backgroundColor)
+    }
+
+    private var readerFont: Font {
+        if fontService.currentFont == "System" {
+            return .system(size: themeService.fontSize)
+        }
+        return .custom(fontService.currentFont, size: themeService.fontSize)
     }
 }
 
@@ -335,12 +352,12 @@ struct PageViewController: UIViewControllerRepresentable {
         // 因为 PageViewController 是 struct，Coordinator 持有的是值拷贝，不会自动更新
         context.coordinator.parent = self
         
-        // 检测尺寸变化，触发重新分页（替代 iOS 14+ 的 .onChange）
+        // 检测尺寸变化，触发重新分页
         let currentSize = uiViewController.view.frame.size
         if context.coordinator.lastSize != nil,
            context.coordinator.lastSize != currentSize,
            !viewModel.pages.isEmpty {
-            viewModel.setAvailableViewHeight(currentSize.height)
+            viewModel.setAvailableViewSize(currentSize)
         }
         context.coordinator.lastSize = currentSize
         
@@ -524,24 +541,39 @@ struct ReaderBottomToolbar: View {
     @ObservedObject private var themeService = ThemeService.shared
     
     var body: some View {
-        HStack {
-            Button(action: onPreviousChapter) {
-                Image(systemName: "backward.end.fill")
-                Text("上一章")
+        VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                Slider(
+                    value: Binding(
+                        get: { progress },
+                        set: { onSliderChange($0) }
+                    ),
+                    in: 0...1
+                )
+                Text("\(Int((progress * 100).rounded()))%")
+                    .font(.system(size: 11))
+                    .frame(width: 36, alignment: .trailing)
             }
-            .font(.caption)
-            .disabled(!hasPreviousChapter)
-            .opacity(hasPreviousChapter ? 1 : 0.5)
-            
-            Spacer()
-            
-            Button(action: onNextChapter) {
-                Text("下一章")
-                Image(systemName: "forward.end.fill")
+
+            HStack {
+                Button(action: onPreviousChapter) {
+                    Image(systemName: "backward.end.fill")
+                    Text("上一章")
+                }
+                .font(.caption)
+                .disabled(!hasPreviousChapter)
+                .opacity(hasPreviousChapter ? 1 : 0.5)
+
+                Spacer()
+
+                Button(action: onNextChapter) {
+                    Text("下一章")
+                    Image(systemName: "forward.end.fill")
+                }
+                .font(.caption)
+                .disabled(!hasNextChapter)
+                .opacity(hasNextChapter ? 1 : 0.5)
             }
-            .font(.caption)
-            .disabled(!hasNextChapter)
-            .opacity(hasNextChapter ? 1 : 0.5)
         }
         .padding()
         .background(themeService.currentTheme.backgroundColor)

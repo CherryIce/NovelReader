@@ -10,10 +10,25 @@ struct CachedPage: Codable {
     let contentOffset: Int
 }
 
-/// 缓存包装结构（包含版本号和视图高度）
+/// 影响分页结果的全部输入，用于校验缓存是否仍然可用
+struct PageCacheDescriptor: Codable, Equatable {
+    let viewportWidth: CGFloat
+    let viewportHeight: CGFloat
+    let fontName: String
+    let fontSize: CGFloat
+    let lineSpacing: CGFloat
+    let paragraphSpacing: CGFloat
+    let horizontalPadding: CGFloat
+    let headerHeight: CGFloat
+    let contentTopPadding: CGFloat
+    let footerHeight: CGFloat
+    let sourceModificationTime: TimeInterval
+}
+
+/// 缓存包装结构（包含版本号和完整分页配置）
 struct CachedPageData: Codable {
     let version: Int
-    let viewHeight: CGFloat
+    let descriptor: PageCacheDescriptor
     let pages: [CachedPage]
 }
 
@@ -22,7 +37,7 @@ class PageCacheManager {
     static let shared = PageCacheManager()
     
     /// 缓存版本号 - 当分页算法变更时递增，使旧缓存自动失效
-    private let cacheVersion = 5
+    private let cacheVersion = 6
     
     private let fileManager = FileManager.default
     private let cacheDirectoryName = "PageCache"
@@ -31,8 +46,8 @@ class PageCacheManager {
     
     /// 获取缓存目录
     private var cacheDirectory: URL {
-        let documents = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let cacheDir = documents.appendingPathComponent(cacheDirectoryName)
+        let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        let cacheDir = caches.appendingPathComponent(cacheDirectoryName)
         
         if !fileManager.fileExists(atPath: cacheDir.path) {
             try? fileManager.createDirectory(at: cacheDir, withIntermediateDirectories: true)
@@ -55,8 +70,8 @@ class PageCacheManager {
     /// 读取缓存
     /// - Parameters:
     ///   - bookId: 书籍ID
-    ///   - expectedViewHeight: 期望的视图高度，如果与缓存中的高度差异超过1pt则缓存失效
-    func loadCache(for bookId: UUID, expectedViewHeight: CGFloat? = nil) -> [Page]? {
+    ///   - expectedDescriptor: 当前分页配置，任一输入变化都会使缓存失效
+    func loadCache(for bookId: UUID, expectedDescriptor: PageCacheDescriptor) -> [Page]? {
         let path = cacheFilePath(for: bookId)
         
         guard let data = try? Data(contentsOf: path) else {
@@ -71,9 +86,8 @@ class PageCacheManager {
                 try? fileManager.removeItem(at: path)
                 return nil
             }
-            // 视图高度不匹配，缓存失效
-            if let expected = expectedViewHeight, abs(cachedData.viewHeight - expected) > 1 {
-                print("Cache view height mismatch (cached: \(cachedData.viewHeight), expected: \(expected)), invalidating cache")
+            // 分页输入不匹配，缓存失效
+            if cachedData.descriptor != expectedDescriptor {
                 try? fileManager.removeItem(at: path)
                 return nil
             }
@@ -99,8 +113,8 @@ class PageCacheManager {
     /// - Parameters:
     ///   - pages: 页面数据
     ///   - bookId: 书籍ID
-    ///   - viewHeight: 当时的视图高度
-    func saveCache(pages: [Page], for bookId: UUID, viewHeight: CGFloat = 0) {
+    ///   - descriptor: 生成这些页面时使用的分页配置
+    func saveCache(pages: [Page], for bookId: UUID, descriptor: PageCacheDescriptor) {
         let path = cacheFilePath(for: bookId)
         
         // 转换为可序列化的 CachedPage
@@ -115,8 +129,7 @@ class PageCacheManager {
             )
         }
         
-        // 使用带版本号和视图高度的包装结构
-        let cachedData = CachedPageData(version: cacheVersion, viewHeight: viewHeight, pages: cachedPages)
+        let cachedData = CachedPageData(version: cacheVersion, descriptor: descriptor, pages: cachedPages)
         
         guard let data = try? JSONEncoder().encode(cachedData) else {
             print("Failed to encode pages for cache")
@@ -124,8 +137,7 @@ class PageCacheManager {
         }
         
         do {
-            try data.write(to: path)
-            print("Saved \(pages.count) pages to cache for book \(bookId)")
+            try data.write(to: path, options: .atomic)
         } catch {
             print("Failed to save cache: \(error)")
         }

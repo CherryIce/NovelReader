@@ -5,7 +5,7 @@ struct CatalogView: View {
     let currentIndex: Int
     let onSelect: (Int) -> Void
     
-    @Environment(\.presentationMode) var presentationMode
+    @Environment(\.dismiss) private var dismiss
     
     var body: some View {
         NavigationView {
@@ -24,7 +24,7 @@ struct CatalogView: View {
             .listStyle(PlainListStyle())
             .navigationBarTitle("目录", displayMode: .inline)
             .navigationBarItems(trailing: Button("完成") {
-                presentationMode.wrappedValue.dismiss()
+                dismiss()
             })
         }
     }

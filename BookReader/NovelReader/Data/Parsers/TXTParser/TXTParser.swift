@@ -14,6 +14,10 @@ class TXTParser {
         "^\\d+[.．、\\s]+.*$",                         // 1. 或 1、
         "^[（(【\\[]?[\\d一二三四五六七八九十]+[)）】\\]]?.*$"  // （一）或【1】
     ]
+
+    private lazy var chapterRegexes: [NSRegularExpression] = chapterPatterns.compactMap {
+        try? NSRegularExpression(pattern: $0, options: .caseInsensitive)
+    }
     
     /// 解析TXT文件
     /// - Parameters:
@@ -30,7 +34,7 @@ class TXTParser {
         if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
            let fileSize = attrs[.size] as? Int64,
            fileSize > maxFileSize {
-            throw ParserError.fileTooLarge(maxSize: fileSize)
+            throw ParserError.fileTooLarge(actualSize: fileSize)
         }
         
         // 只读取一次文件数据（使用内存映射优化大文件读取）
@@ -38,13 +42,8 @@ class TXTParser {
             throw ParserError.readFailed
         }
         
-        // 检测编码（基于已读取的 data，避免重复 I/O）
-        let detectedEncoding = encoding ?? detectEncoding(from: data, fileURL: fileURL)
-        
-        // 解码为字符串
-        guard let content = String(data: data, encoding: detectedEncoding) else {
-            throw ParserError.invalidEncoding
-        }
+        // 以整文件严格解码，避免仅抽样文件头导致编码误判
+        let content = try decode(data: data, preferredEncoding: encoding)
         
         // 解析章节
         let chapters = parseChapters(from: content)
@@ -61,83 +60,41 @@ class TXTParser {
         )
     }
     
-    /// 检测文件编码（基于已读取的 Data，避免重复 I/O）
-    private func detectEncoding(from data: Data, fileURL: URL) -> String.Encoding {
-        // 1. 检查 BOM（Byte Order Mark）
+    /// 按显式编码、BOM、常见中文编码顺序解码
+    private func decode(data: Data, preferredEncoding: String.Encoding?) throws -> String {
+        if let preferredEncoding = preferredEncoding {
+            guard let content = String(data: data, encoding: preferredEncoding) else {
+                throw ParserError.invalidEncoding
+            }
+            return content
+        }
+
         if data.count >= 3, data[0] == 0xEF, data[1] == 0xBB, data[2] == 0xBF {
-            return .utf8
+            guard let content = String(data: data, encoding: .utf8) else {
+                throw ParserError.invalidEncoding
+            }
+            return content
         }
         if data.count >= 2, data[0] == 0xFF, data[1] == 0xFE {
-            return .utf16LittleEndian
+            guard let content = String(data: data, encoding: .utf16LittleEndian) else {
+                throw ParserError.invalidEncoding
+            }
+            return content
         }
         if data.count >= 2, data[0] == 0xFE, data[1] == 0xFF {
-            return .utf16BigEndian
+            guard let content = String(data: data, encoding: .utf16BigEndian) else {
+                throw ParserError.invalidEncoding
+            }
+            return content
         }
-        
-        // 2. 启发式检测：读取前 4KB 进行分析
-        let sampleSize = min(4096, data.count)
-        let sample = data.prefix(sampleSize)
-        
-        // 检查是否为纯 ASCII（ASCII 是 UTF-8 的子集）
-        let isPureASCII = sample.allSatisfy { $0 < 0x80 }
-        if isPureASCII {
-            return .utf8
-        }
-        
-        // 检查是否为有效 UTF-8（严格验证，避免将 GBK 误判为 UTF-8）
-        if isValidUTF8(data: sample) {
-            return .utf8
-        }
-        
-        // 3. 尝试 GB18030（GBK 的超集，兼容 GB2312）
-        if let _ = try? String(contentsOf: fileURL, encoding: .gb_18030_2000) {
-            return .gb_18030_2000
-        }
-        
-        // 4. 尝试 Big5（繁体中文）
-        if let _ = try? String(contentsOf: fileURL, encoding: .big5) {
-            return .big5
-        }
-        
-        return .utf8 // 最终兜底
-    }
-    
-    /// 严格检查数据是否为有效 UTF-8 编码
-    private func isValidUTF8(data: Data.SubSequence) -> Bool {
-        var i = data.startIndex
-        while i < data.endIndex {
-            let byte = data[i]
-            if byte < 0x80 {
-                // 单字节 ASCII
-                i += 1
-            } else if byte >= 0xC2 && byte <= 0xDF {
-                // 双字节序列
-                guard i + 1 < data.endIndex,
-                      data[i + 1] >= 0x80 && data[i + 1] <= 0xBF else { return false }
-                i += 2
-            } else if byte >= 0xE0 && byte <= 0xEF {
-                // 三字节序列
-                guard i + 2 < data.endIndex,
-                      data[i + 1] >= 0x80 && data[i + 1] <= 0xBF,
-                      data[i + 2] >= 0x80 && data[i + 2] <= 0xBF else { return false }
-                // E0 开头时，第二个字节不能是 0x80-0x9F（过长编码）
-                if byte == 0xE0 && data[i + 1] < 0xA0 { return false }
-                i += 3
-            } else if byte >= 0xF0 && byte <= 0xF4 {
-                // 四字节序列
-                guard i + 3 < data.endIndex,
-                      data[i + 1] >= 0x80 && data[i + 1] <= 0xBF,
-                      data[i + 2] >= 0x80 && data[i + 2] <= 0xBF,
-                      data[i + 3] >= 0x80 && data[i + 3] <= 0xBF else { return false }
-                // F4 开头时，第二个字节不能超过 0x8F（超出 Unicode 范围）
-                if byte == 0xF4 && data[i + 1] > 0x8F { return false }
-                i += 4
-            } else {
-                // 0xC0-0xC1（过长编码）或 0xF5-0xFF（无效字节）
-                return false
+
+        for candidate in [String.Encoding.utf8, .gb_18030_2000, .big5] {
+            if let content = String(data: data, encoding: candidate) {
+                return content
             }
         }
-        return true
+
+        throw ParserError.invalidEncoding
     }
     
     /// 解析章节
@@ -161,9 +118,9 @@ class TXTParser {
                         title: currentChapterTitle,
                         content: chapterContent,
                         startLocation: currentLocation,
-                        length: chapterContent.count
+                        length: chapterContent.utf16.count
                     ))
-                    currentLocation += chapterContent.count
+                    currentLocation += chapterContent.utf16.count
                 }
                 
                 // 开始新章节
@@ -182,7 +139,7 @@ class TXTParser {
                 title: currentChapterTitle,
                 content: chapterContent,
                 startLocation: currentLocation,
-                length: chapterContent.count
+                length: chapterContent.utf16.count
             ))
         }
         
@@ -193,7 +150,7 @@ class TXTParser {
                 title: "正文",
                 content: content,
                 startLocation: 0,
-                length: content.count
+                length: content.utf16.count
             ))
         }
         
@@ -206,16 +163,28 @@ class TXTParser {
         guard line.count >= 2 && line.count <= 50 else { return false }
         
         // 检查是否匹配任何章节模式
-        for pattern in chapterPatterns {
-            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
-                let range = NSRange(location: 0, length: line.utf16.count)
-                if regex.firstMatch(in: line, options: [], range: range) != nil {
-                    return true
-                }
+        let range = NSRange(location: 0, length: line.utf16.count)
+        for regex in chapterRegexes {
+            if regex.firstMatch(in: line, options: [], range: range) != nil {
+                return true
             }
         }
         
         return false
+    }
+}
+
+extension TXTParser: BookChapterParsing {
+    func parseChapters(fileURL: URL) throws -> [Chapter] {
+        try parse(fileURL: fileURL).chapters.map { parsedChapter in
+            Chapter(
+                index: parsedChapter.index,
+                title: parsedChapter.title,
+                content: parsedChapter.content,
+                startLocation: parsedChapter.startLocation,
+                length: parsedChapter.length
+            )
+        }
     }
 }
 
@@ -244,7 +213,7 @@ enum ParserError: LocalizedError {
     case readFailed
     case invalidEncoding
     case parseFailed
-    case fileTooLarge(maxSize: Int64)
+    case fileTooLarge(actualSize: Int64)
     
     var errorDescription: String? {
         switch self {

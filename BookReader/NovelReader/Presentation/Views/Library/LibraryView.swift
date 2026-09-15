@@ -1,11 +1,10 @@
 import SwiftUI
-import MobileCoreServices
+import UniformTypeIdentifiers
 
 struct LibraryView: View {
     @ObservedObject private var viewModel = LibraryViewModel()
     @State private var showingDocumentPicker = false
     @State private var selectedBook: Book?
-    @State private var showingReader = false
     @State private var bookToDelete: Book?
     @State private var showingDeleteConfirmation = false
     
@@ -18,17 +17,13 @@ struct LibraryView: View {
             .navigationBarTitle("书架", displayMode: .automatic)
             .navigationBarItems(trailing: addButton)
             .sheet(isPresented: $showingDocumentPicker) {
-                DocumentPicker { url in
+                DocumentPicker(contentTypes: [.plainText]) { url in
                     viewModel.importBook(from: url)
                 }
             }
-            // 使用 UIKit 桥接实现全屏模态展示（iOS 13 兼容）
-            .background(
-                FullScreenCover(
-                    isPresented: $showingReader,
-                    selectedBook: $selectedBook
-                )
-            )
+            .fullScreenCover(item: $selectedBook) { book in
+                ReaderView(book: book)
+            }
             .alert(item: $viewModel.error, content: errorAlert)
             .actionSheet(isPresented: $showingDeleteConfirmation, content: deleteActionSheet)
             .onAppear {
@@ -42,7 +37,7 @@ struct LibraryView: View {
     
     private var backgroundLayer: some View {
         Color(.systemBackground)
-            .edgesIgnoringSafeArea(.all)
+            .ignoresSafeArea()
     }
     
     private var contentLayer: some View {
@@ -88,7 +83,12 @@ struct LibraryView: View {
                     importingProgress: viewModel.importProgress,
                     onSelect: { book in
                         selectedBook = book
-                        showingReader = true
+                    },
+                    onToggleFavorite: { book in
+                        viewModel.toggleFavorite(book)
+                    },
+                    onToggleCompleted: { book in
+                        viewModel.toggleCompleted(book)
                     },
                     onDelete: { book in
                         bookToDelete = book
@@ -164,6 +164,8 @@ struct BooksGridView: View {
     let importingTitle: String
     let importingProgress: String
     let onSelect: (Book) -> Void
+    let onToggleFavorite: (Book) -> Void
+    let onToggleCompleted: (Book) -> Void
     let onDelete: (Book) -> Void
     
     var body: some View {
@@ -187,6 +189,8 @@ struct BooksGridView: View {
                             importingProgress: importingProgress,
                             itemWidth: itemWidth,
                             onSelect: onSelect,
+                            onToggleFavorite: onToggleFavorite,
+                            onToggleCompleted: onToggleCompleted,
                             onDelete: onDelete
                         )
                     }
@@ -208,6 +212,8 @@ struct BookRowView: View {
     let importingProgress: String
     let itemWidth: CGFloat
     let onSelect: (Book) -> Void
+    let onToggleFavorite: (Book) -> Void
+    let onToggleCompleted: (Book) -> Void
     let onDelete: (Book) -> Void
     
     var body: some View {
@@ -222,6 +228,8 @@ struct BookRowView: View {
                     importingProgress: importingProgress,
                     itemWidth: itemWidth,
                     onSelect: onSelect,
+                    onToggleFavorite: onToggleFavorite,
+                    onToggleCompleted: onToggleCompleted,
                     onDelete: onDelete
                 )
             }
@@ -239,6 +247,8 @@ struct BookGridItem: View {
     let importingProgress: String
     let itemWidth: CGFloat
     let onSelect: (Book) -> Void
+    let onToggleFavorite: (Book) -> Void
+    let onToggleCompleted: (Book) -> Void
     let onDelete: (Book) -> Void
     
     var body: some View {
@@ -250,6 +260,18 @@ struct BookGridItem: View {
                         onSelect(books[index])
                     }
                     .contextMenu {
+                        Button(action: { onToggleFavorite(books[index]) }) {
+                            HStack {
+                                Image(systemName: books[index].isFavorite ? "heart.slash" : "heart")
+                                Text(books[index].isFavorite ? "取消收藏" : "收藏")
+                            }
+                        }
+                        Button(action: { onToggleCompleted(books[index]) }) {
+                            HStack {
+                                Image(systemName: books[index].readingStatus == .completed ? "arrow.uturn.backward" : "checkmark.circle")
+                                Text(books[index].readingStatus == .completed ? "标记为在读" : "标记为已读完")
+                            }
+                        }
                         Button(action: { onDelete(books[index]) }) {
                             HStack {
                                 Image(systemName: "trash")
@@ -347,6 +369,17 @@ struct BookCell: View {
                 RoundedRectangle(cornerRadius: 8)
                     .stroke(Color.gray.opacity(0.2), lineWidth: 1)
             )
+            .overlay(
+                Group {
+                    if book.isFavorite {
+                        Image(systemName: "heart.fill")
+                            .font(.caption)
+                            .foregroundColor(.red)
+                            .padding(6)
+                    }
+                },
+                alignment: .topTrailing
+            )
             
             // 书名
             Text(book.title)
@@ -354,6 +387,12 @@ struct BookCell: View {
                 .fontWeight(.medium)
                 .lineLimit(1)
                 .foregroundColor(.primary)
+
+            if book.readingStatus == .completed {
+                Text("已读完")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
         }
     }
 }
@@ -373,7 +412,8 @@ struct ImportingBookCell: View {
                     .aspectRatio(3/4, contentMode: .fit)
                 
                 VStack(spacing: 8) {
-                    ActivityIndicator(isAnimating: true, style: .medium)
+                    ProgressView()
+                        .progressViewStyle(CircularProgressViewStyle())
                     
                     Text(progress)
                         .font(.caption)
@@ -417,78 +457,16 @@ struct EmptyLibraryView: View {
 
 // MARK: - 预览
 
-// MARK: - Full Screen Cover (iOS 13 兼容)
-
-struct FullScreenCover: UIViewControllerRepresentable {
-    @Binding var isPresented: Bool
-    @Binding var selectedBook: Book?
-    
-    func makeCoordinator() -> Coordinator {
-        Coordinator(self)
-    }
-    
-    func makeUIViewController(context: Context) -> UIViewController {
-        let controller = UIViewController()
-        controller.view.backgroundColor = .clear
-        return controller
-    }
-    
-    func updateUIViewController(_ uiViewController: UIViewController, context: Context) {
-        context.coordinator.update(uiViewController: uiViewController, isPresented: isPresented, selectedBook: selectedBook)
-    }
-    
-    class Coordinator: NSObject, UIAdaptivePresentationControllerDelegate {
-        var parent: FullScreenCover
-        var isDismissing = false
-        
-        init(_ parent: FullScreenCover) {
-            self.parent = parent
-            super.init()
-        }
-        
-        func update(uiViewController: UIViewController, isPresented: Bool, selectedBook: Book?) {
-            if isPresented {
-                if uiViewController.presentedViewController == nil && !isDismissing {
-                    guard let book = selectedBook else { return }
-                    let readerView = ReaderView(book: book)
-                    let hostingController = UIHostingController(rootView: readerView)
-                    hostingController.modalPresentationStyle = .fullScreen
-                    
-                    // 监听 dismiss 事件
-                    hostingController.presentationController?.delegate = self
-                    
-                    uiViewController.present(hostingController, animated: true)
-                }
-            } else {
-                if let presented = uiViewController.presentedViewController, !isDismissing {
-                    isDismissing = true
-                    presented.dismiss(animated: true) { [weak self] in
-                        self?.isDismissing = false
-                    }
-                }
-            }
-        }
-        
-        // MARK: - UIAdaptivePresentationControllerDelegate
-        
-        func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
-            // 当用户通过手势或点击背景关闭时，同步状态
-            parent.isPresented = false
-            parent.selectedBook = nil
-            isDismissing = false
-        }
-    }
-}
-
 // MARK: - Document Picker
 
 struct DocumentPicker: UIViewControllerRepresentable {
+    let contentTypes: [UTType]
     let onPick: (URL) -> Void
     
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
         let picker = UIDocumentPickerViewController(
-            documentTypes: [kUTTypeText as String],
-            in: .open
+            forOpeningContentTypes: contentTypes,
+            asCopy: false
         )
         picker.delegate = context.coordinator
         picker.allowsMultipleSelection = false
