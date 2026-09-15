@@ -59,6 +59,9 @@ class LibraryViewModel: ObservableObject {
     private let pdfParser = PDFParser()
     private var cancellables = Set<AnyCancellable>()
     private var booksRequestCancellable: AnyCancellable?
+    private var importCheckCancellable: AnyCancellable?
+    private var importPersistenceCancellable: AnyCancellable?
+    private var pendingBatchImports: [(urls: [URL], removesSourceWhenFinished: Bool)] = []
     private let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "com.freedom.Configures.BookReader",
         category: "BookImport"
@@ -146,9 +149,9 @@ class LibraryViewModel: ObservableObject {
         importingBookTitle = url.deletingPathExtension().lastPathComponent
         isImporting = true
         importProgress = "正在检查..."
-        logger.notice("Import selected: \(url.lastPathComponent, privacy: .public)")
+        logger.notice("Import selected: \(url.lastPathComponent, privacy: .private(mask: .hash))")
 
-        bookRepository.getAllBooks()
+        importCheckCancellable = bookRepository.getAllBooks()
             .receive(on: DispatchQueue.main)
             .sink(
                 receiveCompletion: { [weak self] completion in
@@ -156,6 +159,7 @@ class LibraryViewModel: ObservableObject {
                     self?.isImporting = false
                     self?.importingBookTitle = ""
                     self?.error = self?.userFacingError(from: error)
+                    self?.processNextPendingBatchImportIfNeeded()
                 },
                 receiveValue: { [weak self] books in
                     guard let self else { return }
@@ -163,7 +167,8 @@ class LibraryViewModel: ObservableObject {
                         self.isImporting = false
                         self.importingBookTitle = ""
                         self.error = .bookAlreadyExists
-                        self.logger.notice("Import rejected as duplicate: \(url.lastPathComponent, privacy: .public)")
+                        self.logger.notice("Import rejected as duplicate: \(url.lastPathComponent, privacy: .private(mask: .hash))")
+                        self.processNextPendingBatchImportIfNeeded()
                         return
                     }
 
@@ -175,24 +180,29 @@ class LibraryViewModel: ObservableObject {
                             self.publishImportedBooks([book])
                             self.importSuccess = true
                             self.importedBookTitle = book.title
-                            self.logger.notice("Import committed: \(book.title, privacy: .public)")
+                            self.logger.notice("Import committed: \(book.title, privacy: .private(mask: .hash))")
                         case .failure(let message):
                             self.error = .operationFailed(message: message)
-                            self.logger.error("Import failed: \(message, privacy: .public)")
+                            self.logger.error("Import failed: \(message, privacy: .private)")
                         }
 
                         self.isImporting = false
                         self.importingBookTitle = ""
                         self.importProgress = ""
+                        self.processNextPendingBatchImportIfNeeded()
                     }
                 }
             )
-            .store(in: &cancellables)
     }
 
     /// 批量导入书籍
     func importBooks(from urls: [URL], removesSourceWhenFinished: Bool = false) {
-        guard !urls.isEmpty, !isImporting, !isBatchImporting else { return }
+        guard !urls.isEmpty else { return }
+        guard !isImporting, !isBatchImporting else {
+            pendingBatchImports.append((urls, removesSourceWhenFinished))
+            logger.notice("Batch import queued: \(urls.count) files")
+            return
+        }
 
         batchImportSuccess = false
         batchImportSuccessCount = 0
@@ -204,7 +214,7 @@ class LibraryViewModel: ObservableObject {
         batchImportProgress = "正在检查 \(urls.count) 个文件..."
         logger.notice("Batch import selected: \(urls.count) files")
 
-        bookRepository.getAllBooks()
+        importCheckCancellable = bookRepository.getAllBooks()
             .receive(on: DispatchQueue.main)
             .sink(
                 receiveCompletion: { [weak self] completion in
@@ -214,6 +224,7 @@ class LibraryViewModel: ObservableObject {
                     self.batchImportProgress = ""
                     self.cleanupSourcesIfNeeded(urls, enabled: removesSourceWhenFinished)
                     self.error = self.userFacingError(from: error)
+                    self.processNextPendingBatchImportIfNeeded()
                 },
                 receiveValue: { [weak self] existingBooks in
                     guard let self else { return }
@@ -259,7 +270,6 @@ class LibraryViewModel: ObservableObject {
                     )
                 }
             )
-            .store(in: &cancellables)
     }
 
     private enum ImportResult {
@@ -327,6 +337,7 @@ class LibraryViewModel: ObservableObject {
         batchImportFailCount = failedTitles.count
         batchImportFailedTitles = failedTitles
         logger.notice("Batch import finished: \(successCount) succeeded, \(failedTitles.count) failed")
+        processNextPendingBatchImportIfNeeded()
     }
 
     private func performImport(
@@ -337,18 +348,25 @@ class LibraryViewModel: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let accessing = url.startAccessingSecurityScopedResource()
+            defer {
+                if accessing {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
 
             do {
                 DispatchQueue.main.async {
                     self.importProgress = "正在解析文件..."
-                    self.logger.debug("Parsing: \(url.lastPathComponent, privacy: .public)")
+                    self.logger.debug("Parsing: \(url.lastPathComponent, privacy: .private(mask: .hash))")
                 }
 
-                let parsedBook = try self.parseBook(at: url)
+                let parsedBook = try autoreleasepool {
+                    try self.parseBook(at: url)
+                }
 
                 DispatchQueue.main.async {
                     self.importProgress = "正在复制文件..."
-                    self.logger.debug("Copying: \(url.lastPathComponent, privacy: .public)")
+                    self.logger.debug("Copying: \(url.lastPathComponent, privacy: .private(mask: .hash))")
                 }
 
                 guard let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
@@ -357,14 +375,23 @@ class LibraryViewModel: ObservableObject {
                 let booksDir = documentsDir.appendingPathComponent("Books")
                 try FileManager.default.createDirectory(at: booksDir, withIntermediateDirectories: true)
                 let destinationURL = booksDir.appendingPathComponent(url.lastPathComponent)
-                if FileManager.default.fileExists(atPath: destinationURL.path) {
-                    throw BookError.bookAlreadyExists
+                let stagedURL = booksDir.appendingPathComponent(".book-import-\(UUID().uuidString)")
+                do {
+                    defer { try? FileManager.default.removeItem(at: stagedURL) }
+                    try FileManager.default.copyItem(at: url, to: stagedURL)
+                    try FileManager.default.moveItem(at: stagedURL, to: destinationURL)
+                } catch {
+                    let cocoaError = error as NSError
+                    if cocoaError.domain == NSCocoaErrorDomain,
+                       cocoaError.code == CocoaError.Code.fileWriteFileExists.rawValue {
+                        throw BookError.bookAlreadyExists
+                    }
+                    throw error
                 }
-                try FileManager.default.copyItem(at: url, to: destinationURL)
 
                 DispatchQueue.main.async {
                     self.importProgress = "正在保存..."
-                    self.logger.debug("Saving: \(url.lastPathComponent, privacy: .public)")
+                    self.logger.debug("Saving: \(url.lastPathComponent, privacy: .private(mask: .hash))")
                 }
 
                 let fileSize = (try? FileManager.default.attributesOfItem(atPath: destinationURL.path)[.size] as? Int64) ?? 0
@@ -386,36 +413,49 @@ class LibraryViewModel: ObservableObject {
                 }
 
                 DispatchQueue.main.async {
-                    if accessing {
-                        url.stopAccessingSecurityScopedResource()
-                    }
-
-                    self.bookRepository.addBook(book, chapters: chapters)
+                    var savedBook: Book?
+                    self.importPersistenceCancellable = self.bookRepository.addBook(book, chapters: chapters)
                         .receive(on: DispatchQueue.main)
+                        .first()
                         .sink(
                             receiveCompletion: { [weak self] publisherCompletion in
-                                guard case .failure(let error) = publisherCompletion else { return }
-                                try? FileManager.default.removeItem(at: destinationURL)
-                                self?.cleanupSourceIfNeeded(url, enabled: removesSourceWhenFinished)
-                                completion(.failure("\(url.lastPathComponent): \(error.localizedDescription)"))
+                                switch publisherCompletion {
+                                case .failure(let error):
+                                    try? FileManager.default.removeItem(at: destinationURL)
+                                    self?.cleanupSourceIfNeeded(url, enabled: removesSourceWhenFinished)
+                                    completion(.failure("\(url.lastPathComponent): \(error.localizedDescription)"))
+                                case .finished:
+                                    guard let savedBook else {
+                                        try? FileManager.default.removeItem(at: destinationURL)
+                                        self?.cleanupSourceIfNeeded(url, enabled: removesSourceWhenFinished)
+                                        completion(.failure("\(url.lastPathComponent): 保存未返回结果"))
+                                        return
+                                    }
+                                    self?.cleanupSourceIfNeeded(url, enabled: removesSourceWhenFinished)
+                                    completion(.success(savedBook))
+                                }
                             },
-                            receiveValue: { [weak self] savedBook in
-                                self?.cleanupSourceIfNeeded(url, enabled: removesSourceWhenFinished)
-                                completion(.success(savedBook))
+                            receiveValue: { book in
+                                savedBook = book
                             }
                         )
-                        .store(in: &self.cancellables)
                 }
             } catch {
                 DispatchQueue.main.async {
-                    if accessing {
-                        url.stopAccessingSecurityScopedResource()
-                    }
                     self.cleanupSourceIfNeeded(url, enabled: removesSourceWhenFinished)
                     completion(.failure("\(url.lastPathComponent): \(error.localizedDescription)"))
                 }
             }
         }
+    }
+
+    private func processNextPendingBatchImportIfNeeded() {
+        guard !isImporting, !isBatchImporting, !pendingBatchImports.isEmpty else { return }
+        let pendingImport = pendingBatchImports.removeFirst()
+        importBooks(
+            from: pendingImport.urls,
+            removesSourceWhenFinished: pendingImport.removesSourceWhenFinished
+        )
     }
 
     private func parseBook(at url: URL) throws -> ParsedBook {

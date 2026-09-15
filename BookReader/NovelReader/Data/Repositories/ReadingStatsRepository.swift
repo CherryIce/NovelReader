@@ -27,6 +27,7 @@ class ReadingStatsRepository: ReadingStatsRepositoryProtocol {
                     try self.context.save()
                     promise(.success(()))
                 } catch {
+                    self.context.rollback()
                     promise(.failure(error))
                 }
             }
@@ -199,6 +200,7 @@ class ReadingStatsRepository: ReadingStatsRepositoryProtocol {
                     try self.context.save()
                     promise(.success(()))
                 } catch {
+                    self.context.rollback()
                     promise(.failure(error))
                 }
             }

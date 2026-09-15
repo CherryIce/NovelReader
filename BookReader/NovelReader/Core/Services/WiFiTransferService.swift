@@ -16,9 +16,15 @@ final class WiFiTransferService: NSObject, ObservableObject {
     private let queue = DispatchQueue(label: "com.bookreader.wifi-transfer", attributes: .concurrent)
     private let receiveChunkSize = 64 * 1024
     private let maximumHeaderSize = 32 * 1024
+    private let maximumMultipartHeaderSize = 16 * 1024
     private let maximumUploadBodySize = 202 * 1024 * 1024
     private let maximumSingleFileSize = 200 * 1024 * 1024
     private var sessionToken = UUID().uuidString
+
+    private final class RequestBuffer {
+        var data = Data()
+        var hasReservedBodyCapacity = false
+    }
 
     private override init() {
         super.init()
@@ -118,10 +124,10 @@ final class WiFiTransferService: NSObject, ObservableObject {
     /// 处理新连接
     private func handleConnection(_ connection: NWConnection) {
         connection.start(queue: queue)
-        receiveRequest(connection: connection, buffer: Data())
+        receiveRequest(connection: connection, requestBuffer: RequestBuffer())
     }
 
-    private func receiveRequest(connection: NWConnection, buffer: Data) {
+    private func receiveRequest(connection: NWConnection, requestBuffer: RequestBuffer) {
         connection.receive(
             minimumIncompleteLength: 1,
             maximumLength: receiveChunkSize,
@@ -133,25 +139,24 @@ final class WiFiTransferService: NSObject, ObservableObject {
                     return
                 }
 
-                var updatedBuffer = buffer
                 if let data {
-                    updatedBuffer.append(data)
+                    requestBuffer.data.append(data)
                 }
 
-                guard let headerRange = updatedBuffer.range(of: Data("\r\n\r\n".utf8)) else {
-                    if updatedBuffer.count > self.maximumHeaderSize {
+                guard let headerRange = requestBuffer.data.range(of: Data("\r\n\r\n".utf8)) else {
+                    if requestBuffer.data.count > self.maximumHeaderSize {
                         self.sendResponse(connection: connection, statusCode: 431, body: "Request Header Too Large")
                     } else if isComplete {
                         self.sendResponse(connection: connection, statusCode: 400, body: "Incomplete Request")
                     } else {
-                        self.receiveRequest(connection: connection, buffer: updatedBuffer)
+                        self.receiveRequest(connection: connection, requestBuffer: requestBuffer)
                     }
                     return
                 }
 
                 guard headerRange.lowerBound <= self.maximumHeaderSize,
                       let headerString = String(
-                        data: updatedBuffer[..<headerRange.lowerBound],
+                        data: requestBuffer.data[..<headerRange.lowerBound],
                         encoding: .utf8
                       ),
                       let requestHead = self.parseRequestHead(headerString) else {
@@ -159,8 +164,57 @@ final class WiFiTransferService: NSObject, ObservableObject {
                     return
                 }
 
-                let contentLength = requestHead.headers["content-length"].flatMap(Int.init) ?? 0
-                guard contentLength >= 0, contentLength <= self.maximumUploadBodySize else {
+                guard let requestComponents = URLComponents(
+                    string: "http://localhost\(requestHead.target)"
+                ) else {
+                    self.sendResponse(connection: connection, statusCode: 400, body: "Bad Request")
+                    return
+                }
+                let token = requestComponents.queryItems?.first(where: { $0.name == "token" })?.value
+                guard token == self.sessionToken else {
+                    self.sendResponse(connection: connection, statusCode: 401, body: "Unauthorized")
+                    return
+                }
+
+                guard requestHead.headers["transfer-encoding"] == nil else {
+                    self.sendResponse(connection: connection, statusCode: 400, body: "Transfer Encoding Not Supported")
+                    return
+                }
+
+                let isUpload = requestHead.method == "POST" && requestComponents.path == "/upload"
+                let isUploadPage = requestHead.method == "GET"
+                    && (requestComponents.path == "/" || requestComponents.path == "/index.html")
+                guard isUpload || isUploadPage else {
+                    self.sendResponse(connection: connection, statusCode: 404, body: "Not Found")
+                    return
+                }
+                if isUpload {
+                    let contentType = requestHead.headers["content-type"] ?? ""
+                    let boundary = self.extractBoundary(from: contentType)
+                    guard contentType.lowercased().hasPrefix("multipart/form-data;"),
+                          !boundary.isEmpty,
+                          boundary.utf8.count <= 200 else {
+                        self.sendResponse(connection: connection, statusCode: 400, body: "Invalid multipart")
+                        return
+                    }
+                }
+                if isUpload, requestHead.headers["content-length"] == nil {
+                    self.sendResponse(connection: connection, statusCode: 411, body: "Content Length Required")
+                    return
+                }
+
+                let contentLength: Int
+                if let rawContentLength = requestHead.headers["content-length"] {
+                    guard let parsedContentLength = Int(rawContentLength) else {
+                        self.sendResponse(connection: connection, statusCode: 400, body: "Invalid Content Length")
+                        return
+                    }
+                    contentLength = parsedContentLength
+                } else {
+                    contentLength = 0
+                }
+                let maximumBodySize = isUpload ? self.maximumUploadBodySize : 0
+                guard contentLength >= 0, contentLength <= maximumBodySize else {
                     self.sendResponse(connection: connection, statusCode: 413, body: "Upload Too Large")
                     return
                 }
@@ -171,17 +225,29 @@ final class WiFiTransferService: NSObject, ObservableObject {
                     return
                 }
 
-                if updatedBuffer.count < expectedLength {
+                if !requestBuffer.hasReservedBodyCapacity {
+                    requestBuffer.data.reserveCapacity(expectedLength)
+                    requestBuffer.hasReservedBodyCapacity = true
+                }
+
+                if requestBuffer.data.count < expectedLength {
                     if isComplete {
                         self.sendResponse(connection: connection, statusCode: 400, body: "Incomplete Request Body")
                     } else {
-                        self.receiveRequest(connection: connection, buffer: updatedBuffer)
+                        self.receiveRequest(connection: connection, requestBuffer: requestBuffer)
                     }
                     return
                 }
 
-                let body = Data(updatedBuffer[headerRange.upperBound..<expectedLength])
-                self.handleHTTPRequest(requestHead: requestHead, body: body, connection: connection)
+                if requestBuffer.data.count > expectedLength {
+                    requestBuffer.data.removeSubrange(expectedLength..<requestBuffer.data.endIndex)
+                }
+                requestBuffer.data.removeSubrange(requestBuffer.data.startIndex..<headerRange.upperBound)
+                self.handleHTTPRequest(
+                    requestHead: requestHead,
+                    body: requestBuffer.data,
+                    connection: connection
+                )
             }
         )
     }
@@ -250,17 +316,27 @@ final class WiFiTransferService: NSObject, ObservableObject {
             return
         }
 
-        let parts = multipartParts(in: data, boundary: boundary)
+        let partRanges = multipartPartRanges(in: data, boundary: boundary)
+        guard !partRanges.isEmpty else {
+            sendResponse(connection: connection, statusCode: 400, body: "Invalid multipart")
+            return
+        }
+
         var uploadedFiles: [String] = []
         var failedFiles: [String] = []
         var uploadedURLs: [URL] = []
+        var receivedFilenames = Set<String>()
         let uploadDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("BookReaderWiFiUploads", isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
 
-        for part in parts {
-            guard let parsedPart = parseMultipartFile(part) else { continue }
+        for partRange in partRanges {
+            guard let parsedPart = parseMultipartFile(in: data, partRange: partRange) else { continue }
             let filename = parsedPart.filename
+            guard receivedFilenames.insert(filename.lowercased()).inserted else {
+                failedFiles.append("\(filename): 同一批次存在重名文件")
+                continue
+            }
 
             // 验证文件类型
             let ext = (filename as NSString).pathExtension.lowercased()
@@ -269,18 +345,19 @@ final class WiFiTransferService: NSObject, ObservableObject {
                 continue
             }
 
-            guard parsedPart.data.count <= maximumSingleFileSize else {
+            guard parsedPart.dataRange.count <= maximumSingleFileSize else {
                 failedFiles.append("\(filename): 文件超过 200MB")
                 continue
             }
 
+            let destinationURL = uploadDirectory.appendingPathComponent(filename, isDirectory: false)
             do {
                 try FileManager.default.createDirectory(at: uploadDirectory, withIntermediateDirectories: true)
-                let destinationURL = uploadDirectory.appendingPathComponent(filename, isDirectory: false)
-                try parsedPart.data.write(to: destinationURL, options: [.atomic, .withoutOverwriting])
+                try data[parsedPart.dataRange].write(to: destinationURL, options: .withoutOverwriting)
                 uploadedFiles.append(filename)
                 uploadedURLs.append(destinationURL)
             } catch {
+                try? FileManager.default.removeItem(at: destinationURL)
                 failedFiles.append("\(filename): \(error.localizedDescription)")
             }
         }
@@ -320,32 +397,48 @@ final class WiFiTransferService: NSObject, ObservableObject {
         )
     }
 
-    private func multipartParts(in data: Data, boundary: String) -> [Data] {
+    private func multipartPartRanges(in data: Data, boundary: String) -> [Range<Data.Index>] {
         let marker = Data("--\(boundary)".utf8)
         guard let firstBoundary = data.range(of: marker) else { return [] }
 
-        var parts: [Data] = []
+        var partRanges: [Range<Data.Index>] = []
         var partStart = firstBoundary.upperBound
         while partStart < data.endIndex,
               let nextBoundary = data.range(of: marker, in: partStart..<data.endIndex) {
-            var part = Data(data[partStart..<nextBoundary.lowerBound])
-            if part.starts(with: Data("\r\n".utf8)) {
-                part.removeFirst(2)
+            var lowerBound = partStart
+            var upperBound = nextBoundary.lowerBound
+            if upperBound - lowerBound >= 2,
+               data[lowerBound] == 13,
+               data[data.index(after: lowerBound)] == 10 {
+                lowerBound += 2
             }
-            if part.suffix(2) == Data("\r\n".utf8) {
-                part.removeLast(2)
+            if upperBound - lowerBound >= 2,
+               data[data.index(upperBound, offsetBy: -2)] == 13,
+               data[data.index(before: upperBound)] == 10 {
+                upperBound -= 2
             }
-            if !part.isEmpty, !part.starts(with: Data("--".utf8)) {
-                parts.append(part)
+            if lowerBound < upperBound {
+                partRanges.append(lowerBound..<upperBound)
             }
             partStart = nextBoundary.upperBound
         }
-        return parts
+        return partRanges
     }
 
-    private func parseMultipartFile(_ part: Data) -> (filename: String, data: Data)? {
-        guard let headerRange = part.range(of: Data("\r\n\r\n".utf8)),
-              let header = String(data: part[..<headerRange.lowerBound], encoding: .utf8),
+    private func parseMultipartFile(
+        in data: Data,
+        partRange: Range<Data.Index>
+    ) -> (filename: String, dataRange: Range<Data.Index>)? {
+        let headerSearchUpperBound = min(
+            partRange.upperBound,
+            data.index(partRange.lowerBound, offsetBy: maximumMultipartHeaderSize, limitedBy: partRange.upperBound)
+                ?? partRange.upperBound
+        )
+        guard let headerRange = data.range(
+                of: Data("\r\n\r\n".utf8),
+                in: partRange.lowerBound..<headerSearchUpperBound
+              ),
+              let header = String(data: data[partRange.lowerBound..<headerRange.lowerBound], encoding: .utf8),
               let filenameMarker = header.range(of: "filename=\"", options: .caseInsensitive) else {
             return nil
         }
@@ -355,7 +448,7 @@ final class WiFiTransferService: NSObject, ObservableObject {
         let rawFilename = String(filenameTail[..<closingQuote])
         guard let filename = sanitizedFilename(rawFilename) else { return nil }
 
-        return (filename, Data(part[headerRange.upperBound...]))
+        return (filename, headerRange.upperBound..<partRange.upperBound)
     }
 
     private func sanitizedFilename(_ rawFilename: String) -> String? {
@@ -742,6 +835,7 @@ final class WiFiTransferService: NSObject, ObservableObject {
         case 200: statusText = "OK"
         case 400: statusText = "Bad Request"
         case 401: statusText = "Unauthorized"
+        case 411: statusText = "Length Required"
         case 404: statusText = "Not Found"
         case 413: statusText = "Payload Too Large"
         case 431: statusText = "Request Header Fields Too Large"
@@ -753,7 +847,11 @@ final class WiFiTransferService: NSObject, ObservableObject {
             + "Content-Type: \(contentType)\r\n"
             + "Content-Length: \(bodyData.count)\r\n"
             + "Connection: close\r\n"
+            + "Cache-Control: no-store\r\n"
+            + "Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'\r\n"
+            + "Referrer-Policy: no-referrer\r\n"
             + "X-Content-Type-Options: nosniff\r\n"
+            + "X-Frame-Options: DENY\r\n"
             + "\r\n"
 
         var response = Data(responseHead.utf8)

@@ -59,6 +59,7 @@ class BookRepository: BookRepositoryProtocol {
                     try self.context.save()
                     promise(.success(book))
                 } catch {
+                    self.context.rollback()
                     promise(.failure(error))
                 }
             }
@@ -112,6 +113,7 @@ class BookRepository: BookRepositoryProtocol {
                         promise(.failure(BookError.notFound))
                     }
                 } catch {
+                    self.context.rollback()
                     promise(.failure(error))
                 }
             }
@@ -136,6 +138,7 @@ class BookRepository: BookRepositoryProtocol {
                         promise(.failure(BookError.notFound))
                     }
                 } catch {
+                    self.context.rollback()
                     promise(.failure(error))
                 }
             }
@@ -233,6 +236,7 @@ class BookRepository: BookRepositoryProtocol {
                         promise(.failure(BookError.notFound))
                     }
                 } catch {
+                    self.context.rollback()
                     promise(.failure(error))
                 }
             }
@@ -255,6 +259,7 @@ class BookRepository: BookRepositoryProtocol {
                         promise(.failure(BookError.notFound))
                     }
                 } catch {
+                    self.context.rollback()
                     promise(.failure(error))
                 }
             }

@@ -34,7 +34,7 @@ class TXTParser {
         if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
            let fileSize = attrs[.size] as? Int64,
            fileSize > maxFileSize {
-            throw ParserError.fileTooLarge(actualSize: fileSize)
+            throw ParserError.fileTooLarge(actualSize: fileSize, maximumSize: maxFileSize)
         }
         
         // 只读取一次文件数据（使用内存映射优化大文件读取）
@@ -213,7 +213,7 @@ enum ParserError: LocalizedError {
     case readFailed
     case invalidEncoding
     case parseFailed
-    case fileTooLarge(actualSize: Int64)
+    case fileTooLarge(actualSize: Int64, maximumSize: Int64)
     
     var errorDescription: String? {
         switch self {
@@ -225,9 +225,10 @@ enum ParserError: LocalizedError {
             return "无法识别文件编码，请确保文件为 UTF-8、GBK 或 Big5 编码"
         case .parseFailed:
             return "文件解析失败"
-        case .fileTooLarge(let size):
+        case .fileTooLarge(let size, let maximumSize):
             let sizeMB = size / 1024 / 1024
-            return "文件过大（\(sizeMB)MB），暂不支持超过 50MB 的文件"
+            let maximumSizeMB = maximumSize / 1024 / 1024
+            return "文件过大（\(sizeMB)MB），暂不支持超过 \(maximumSizeMB)MB 的文件"
         }
     }
 }

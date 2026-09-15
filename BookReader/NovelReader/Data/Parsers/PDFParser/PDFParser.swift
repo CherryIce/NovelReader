@@ -21,7 +21,7 @@ class PDFParser {
         if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
            let fileSize = attrs[.size] as? Int64,
            fileSize > maxFileSize {
-            throw ParserError.fileTooLarge(actualSize: fileSize)
+            throw ParserError.fileTooLarge(actualSize: fileSize, maximumSize: maxFileSize)
         }
         
         // 3. 使用 PDFKit 打开文档
@@ -56,6 +56,15 @@ class PDFParser {
                 outline: outline,
                 pageCount: pageCount
             )
+
+            // 部分 PDF 的目录目标页无效或全部落在同一页。目录无法形成有效章节时，
+            // 回退到稳定的按页分章，避免导入失败或生成空书籍。
+            if chapters.isEmpty {
+                chapters = parseChaptersByPages(
+                    document: document,
+                    pageCount: pageCount
+                )
+            }
         } else {
             // 无大纲，按页分组（每 N 页为一章，或单页为一章）
             chapters = parseChaptersByPages(
@@ -97,7 +106,25 @@ class PDFParser {
     private struct OutlineNode {
         let title: String
         let pageIndex: Int
-        let level: Int
+    }
+
+    struct PageRange: Equatable {
+        let startPage: Int
+        let endPage: Int
+    }
+
+    /// 将 PDF 大纲中的页码整理为递增、不重叠且位于文档范围内的章节区间。
+    /// PDF 目录允许嵌套、重复目标页，第三方文件也可能写入越界目标页。
+    static func normalizedPageRanges(pageIndices: [Int], pageCount: Int) -> [PageRange] {
+        guard pageCount > 0 else { return [] }
+
+        let validStartPages = Array(Set(pageIndices.filter { (0..<pageCount).contains($0) })).sorted()
+        return validStartPages.enumerated().map { index, startPage in
+            let endPage = index + 1 < validStartPages.count
+                ? validStartPages[index + 1] - 1
+                : pageCount - 1
+            return PageRange(startPage: startPage, endPage: endPage)
+        }
     }
     
     /// 解析 PDF 大纲（目录树）
@@ -108,30 +135,25 @@ class PDFParser {
             return nodes
         }
         
-        traverseOutline(outline, level: 0, nodes: &nodes, document: document)
+        traverseOutline(outline, nodes: &nodes, document: document)
         
         return nodes
     }
     
     /// 递归遍历大纲树
-    private func traverseOutline(_ node: PDFOutline, level: Int, nodes: inout [OutlineNode], document: PDFDocument) {
+    private func traverseOutline(_ node: PDFOutline, nodes: inout [OutlineNode], document: PDFDocument) {
         let title = node.label?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        
-        // 获取目标页码
-        var pageIndex = 0
-        if let destination = node.destination,
-           let page = destination.page {
-            pageIndex = document.index(for: page)
-        }
-        
-        if !title.isEmpty {
-            nodes.append(OutlineNode(title: title, pageIndex: pageIndex, level: level))
+
+        // 没有目标页的分组节点不能作为章节起点，否则会被错误归到第 1 页。
+        if !title.isEmpty,
+           let page = node.destination?.page {
+            nodes.append(OutlineNode(title: title, pageIndex: document.index(for: page)))
         }
         
         // 遍历子节点
         for childIndex in 0..<node.numberOfChildren {
             if let child = node.child(at: childIndex) {
-                traverseOutline(child, level: level + 1, nodes: &nodes, document: document)
+                traverseOutline(child, nodes: &nodes, document: document)
             }
         }
     }
@@ -140,13 +162,31 @@ class PDFParser {
     
     private func parseChaptersByOutline(document: PDFDocument, outline: [OutlineNode], pageCount: Int) -> [ParsedChapter] {
         var chapters: [ParsedChapter] = []
-        
-        for (index, node) in outline.enumerated() {
-            let startPage = node.pageIndex
-            let endPage = (index + 1 < outline.count) ? outline[index + 1].pageIndex - 1 : pageCount - 1
-            
-            let content = extractText(from: document, startPage: startPage, endPage: endPage)
+
+        // 同一页可能同时挂有父级和子级目录。保留遍历到的第一个标题，
+        // 再按实际页码排序，避免出现 5...3 这类非法闭区间导致运行时崩溃。
+        var nodeByPage: [Int: OutlineNode] = [:]
+        for node in outline where (0..<pageCount).contains(node.pageIndex) {
+            if nodeByPage[node.pageIndex] == nil {
+                nodeByPage[node.pageIndex] = node
+            }
+        }
+
+        let ranges = Self.normalizedPageRanges(
+            pageIndices: Array(nodeByPage.keys),
+            pageCount: pageCount
+        )
+
+        for range in ranges {
+            guard let node = nodeByPage[range.startPage] else { continue }
+            let content = extractText(
+                from: document,
+                startPage: range.startPage,
+                endPage: range.endPage
+            )
             let trimmedContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            guard !trimmedContent.isEmpty else { continue }
             
             chapters.append(ParsedChapter(
                 index: chapters.count,
@@ -209,9 +249,15 @@ class PDFParser {
     
     /// 提取指定页码范围的文本
     private func extractText(from document: PDFDocument, startPage: Int, endPage: Int) -> String {
+        guard document.pageCount > 0 else { return "" }
+
+        let lowerBound = max(0, startPage)
+        let upperBound = min(endPage, document.pageCount - 1)
+        guard lowerBound <= upperBound else { return "" }
+
         var texts: [String] = []
         
-        for i in startPage...endPage {
+        for i in lowerBound...upperBound {
             guard let page = document.page(at: i) else { continue }
             let pageText = page.string ?? ""
             let trimmed = pageText.trimmingCharacters(in: .whitespacesAndNewlines)

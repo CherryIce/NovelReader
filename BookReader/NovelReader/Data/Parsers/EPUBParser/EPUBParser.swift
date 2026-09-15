@@ -34,7 +34,7 @@ class EPUBParser {
         if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
            let fileSize = attrs[.size] as? Int64,
            fileSize > maxFileSize {
-            throw ParserError.fileTooLarge(actualSize: fileSize)
+            throw ParserError.fileTooLarge(actualSize: fileSize, maximumSize: maxFileSize)
         }
         
         // 3. 解压 EPUB 到临时目录
@@ -436,9 +436,9 @@ import Compression
 /// 仅支持 DEFLATE 和 STORE 方法，满足 EPUB 需求
 private final class Archive {
     private let fileHandle: FileHandle
-    private let fileSize: UInt64
     private let centralDirectoryOffset: UInt64
     private var entries: [Entry] = []
+    private static let maximumCompressedEntrySize: UInt64 = 65 * 1024 * 1024
     private static let maximumEntrySize: UInt64 = 64 * 1024 * 1024
     private static let maximumTotalUncompressedSize: UInt64 = 256 * 1024 * 1024
     
@@ -447,6 +447,7 @@ private final class Archive {
         let compressedSize: UInt32
         let uncompressedSize: UInt32
         let compressionMethod: UInt16
+        let generalPurposeBitFlag: UInt16
         let localHeaderOffset: UInt32
         let crc32: UInt32
     }
@@ -460,16 +461,19 @@ private final class Archive {
         do {
             // 读取 End of Central Directory Record
             let fileSize = try handle.seekToEnd()
-            self.fileSize = fileSize
             let maximumEOCDSearchLength = 65_557
             let tailLength = min(maximumEOCDSearchLength, Int(fileSize))
             try handle.seek(toOffset: fileSize - UInt64(tailLength))
             let tailData = handle.readData(ofLength: tailLength)
 
             guard let eocdOffset = Self.findEOCD(in: tailData),
+                  tailData.readUInt16LE(at: eocdOffset + 4) == 0,
+                  tailData.readUInt16LE(at: eocdOffset + 6) == 0,
+                  let entriesOnDisk = tailData.readUInt16LE(at: eocdOffset + 8),
                   let totalEntries = tailData.readUInt16LE(at: eocdOffset + 10),
                   let centralDirectorySize = tailData.readUInt32LE(at: eocdOffset + 12),
-                  let centralDirectoryOffset = tailData.readUInt32LE(at: eocdOffset + 16) else {
+                  let centralDirectoryOffset = tailData.readUInt32LE(at: eocdOffset + 16),
+                  entriesOnDisk == totalEntries else {
                 handle.closeFile()
                 return nil
             }
@@ -495,6 +499,7 @@ private final class Archive {
             for _ in 0..<totalEntries {
                 guard offset + 46 <= cdData.count,
                       cdData.readUInt32LE(at: offset) == 0x02014B50,
+                      let generalPurposeBitFlag = cdData.readUInt16LE(at: offset + 8),
                       let compressionMethod = cdData.readUInt16LE(at: offset + 10),
                       let crc32 = cdData.readUInt32LE(at: offset + 16),
                       let compressedSize = cdData.readUInt32LE(at: offset + 20),
@@ -525,7 +530,9 @@ private final class Archive {
                 }
 
                 let entryUncompressedSize = UInt64(uncompressedSize)
-                guard entryUncompressedSize <= Self.maximumEntrySize,
+                guard generalPurposeBitFlag & 0x0001 == 0,
+                      UInt64(compressedSize) <= Self.maximumCompressedEntrySize,
+                      entryUncompressedSize <= Self.maximumEntrySize,
                       totalUncompressedSize <= Self.maximumTotalUncompressedSize - entryUncompressedSize else {
                     handle.closeFile()
                     return nil
@@ -537,6 +544,7 @@ private final class Archive {
                     compressedSize: compressedSize,
                     uncompressedSize: uncompressedSize,
                     compressionMethod: compressionMethod,
+                    generalPurposeBitFlag: generalPurposeBitFlag,
                     localHeaderOffset: localHeaderOffset,
                     crc32: crc32
                 ))
@@ -554,6 +562,8 @@ private final class Archive {
     }
     
     func extract(to destinationURL: URL) throws {
+        var extractedPaths = Set<String>()
+
         for entry in entries {
             // 跳过目录和隐藏文件（macOS 的 __MACOSX 等）
             if entry.filename.hasSuffix("/") || entry.filename.hasPrefix("__MACOSX") || entry.filename.contains("/__MACOSX") {
@@ -561,6 +571,9 @@ private final class Archive {
             }
 
             guard let targetURL = containedFileURL(baseURL: destinationURL, relativePath: entry.filename) else {
+                throw ParserError.parseFailed
+            }
+            guard extractedPaths.insert(targetURL.path).inserted else {
                 throw ParserError.parseFailed
             }
 
@@ -573,14 +586,16 @@ private final class Archive {
             let localHeader = fileHandle.readData(ofLength: 30)
             guard localHeader.count == 30,
                   localHeader.readUInt32LE(at: 0) == 0x04034B50,
+                  localHeader.readUInt16LE(at: 6) == entry.generalPurposeBitFlag,
+                  localHeader.readUInt16LE(at: 8) == entry.compressionMethod,
                   let localFilenameLen = localHeader.readUInt16LE(at: 26),
                   let localExtraLen = localHeader.readUInt16LE(at: 28) else {
                 throw ParserError.parseFailed
             }
 
             let dataOffset = UInt64(entry.localHeaderOffset) + 30 + UInt64(localFilenameLen) + UInt64(localExtraLen)
-            guard dataOffset <= fileSize,
-                  UInt64(entry.compressedSize) <= fileSize - dataOffset else {
+            guard dataOffset <= centralDirectoryOffset,
+                  UInt64(entry.compressedSize) <= centralDirectoryOffset - dataOffset else {
                 throw ParserError.parseFailed
             }
 
@@ -603,7 +618,13 @@ private final class Archive {
                 throw ParserError.parseFailed
             }
 
-            try decompressedData.write(to: targetURL, options: [.atomic, .withoutOverwriting])
+            guard Self.crc32(for: decompressedData) == entry.crc32 else {
+                throw ParserError.parseFailed
+            }
+
+            // `.atomic` 与 `.withoutOverwriting` 组合会在部分 Foundation 版本触发断言。
+            // 路径唯一性已经在上方校验，因此这里只做原子写入。
+            try decompressedData.write(to: targetURL, options: .atomic)
         }
     }
 
@@ -644,16 +665,36 @@ private final class Archive {
         let tailBytes = [UInt8](tailData)
 
         for i in stride(from: tailBytes.count - 22, through: 0, by: -1) {
-            if i + 4 <= tailBytes.count {
-                if tailBytes[i] == signature[0] &&
-                   tailBytes[i+1] == signature[1] &&
-                   tailBytes[i+2] == signature[2] &&
-                   tailBytes[i+3] == signature[3] {
-                    return i
-                }
+            guard tailBytes[i] == signature[0],
+                  tailBytes[i + 1] == signature[1],
+                  tailBytes[i + 2] == signature[2],
+                  tailBytes[i + 3] == signature[3],
+                  let commentLength = tailData.readUInt16LE(at: i + 20),
+                  i + 22 + Int(commentLength) == tailBytes.count else {
+                continue
             }
+            return i
         }
         return nil
+    }
+
+    private static let crc32Table: [UInt32] = (0..<256).map { value in
+        var checksum = UInt32(value)
+        for _ in 0..<8 {
+            checksum = (checksum & 1) == 1
+                ? 0xEDB8_8320 ^ (checksum >> 1)
+                : checksum >> 1
+        }
+        return checksum
+    }
+
+    private static func crc32(for data: Data) -> UInt32 {
+        var checksum = UInt32.max
+        for byte in data {
+            let tableIndex = Int((checksum ^ UInt32(byte)) & 0xFF)
+            checksum = crc32Table[tableIndex] ^ (checksum >> 8)
+        }
+        return checksum ^ UInt32.max
     }
 }
 
