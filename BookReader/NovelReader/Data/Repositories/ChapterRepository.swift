@@ -5,8 +5,9 @@ import Combine
 class ChapterRepository: ChapterRepositoryProtocol {
     private let context: NSManagedObjectContext
     
-    init(context: NSManagedObjectContext = PersistenceController.shared.container.viewContext) {
+    init(context: NSManagedObjectContext = PersistenceController.shared.container.newBackgroundContext()) {
         self.context = context
+        self.context.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
     }
     
     func getChapters(forBookId bookId: UUID) -> AnyPublisher<[Chapter], Error> {

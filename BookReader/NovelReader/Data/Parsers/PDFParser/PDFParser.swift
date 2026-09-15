@@ -1,5 +1,5 @@
 import Foundation
-import UIKit
+import PDFKit
 
 /// PDF 文件解析器
 /// 使用 Apple PDFKit 提取文本内容，按页分割章节
@@ -21,7 +21,7 @@ class PDFParser {
         if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
            let fileSize = attrs[.size] as? Int64,
            fileSize > maxFileSize {
-            throw ParserError.fileTooLarge(maxSize: fileSize)
+            throw ParserError.fileTooLarge(actualSize: fileSize)
         }
         
         // 3. 使用 PDFKit 打开文档
@@ -35,10 +35,12 @@ class PDFParser {
         }
         
         // 4. 提取元数据
-        let title = document.documentTitle?.isEmpty == false
-            ? document.documentTitle!
-            : fileURL.deletingPathExtension().lastPathComponent
-        let author = document.documentAuthor?.isEmpty == false ? document.documentAuthor : nil
+        let attributes = document.documentAttributes
+        let metadataTitle = attributes?[PDFDocumentAttribute.titleAttribute] as? String
+        let metadataAuthor = attributes?[PDFDocumentAttribute.authorAttribute] as? String
+        let title = metadataTitle.flatMap { $0.isEmpty ? nil : $0 }
+            ?? fileURL.deletingPathExtension().lastPathComponent
+        let author = metadataAuthor.flatMap { $0.isEmpty ? nil : $0 }
         
         // 5. 提取每页文本并按逻辑分章
         var chapters: [ParsedChapter] = []
@@ -70,9 +72,9 @@ class PDFParser {
                 title: chapters[i].title,
                 content: chapters[i].content,
                 startLocation: totalLocation,
-                length: chapters[i].content.count
+                length: chapters[i].content.utf16.count
             )
-            totalLocation += chapters[i].content.count
+            totalLocation += chapters[i].content.utf16.count
         }
         
         // 如果没有解析到任何内容，报错
@@ -152,7 +154,7 @@ class PDFParser {
                 title: node.title,
                 content: trimmedContent,
                 startLocation: 0,
-                length: trimmedContent.count
+                length: trimmedContent.utf16.count
             ))
         }
         
@@ -194,7 +196,7 @@ class PDFParser {
                 title: title,
                 content: trimmedContent,
                 startLocation: 0,
-                length: trimmedContent.count
+                length: trimmedContent.utf16.count
             ))
             
             chapterIndex += 1

@@ -1,26 +1,27 @@
 # BookReader - iOS 小说阅读器
 
-一个基于 Swift + UIKit/SwiftUI 混编开发的 iOS 小说阅读器，支持 iOS 13+，采用 MVVM + Clean Architecture 架构。
+一个基于 Swift + UIKit/SwiftUI 混编开发的 iOS 小说阅读器，支持 iOS 15+，采用 MVVM + Clean Architecture 架构。
 
 ## 📱 功能特性
 
 ### 已实现功能
-- ✅ **书架管理** - 网格展示、搜索、筛选（全部/在读/已读完/收藏）
+- ✅ **书架管理** - 网格展示、独立搜索页、筛选（全部/在读/已读完/收藏），支持收藏和完成状态切换
 - ✅ **TXT 解析** - 自动识别章节标题，支持 UTF-8/GBK/GB18030/Big5 编码自动检测
-- ✅ **阅读器** - 基于 UIPageViewController 翻页、Core Text 分页引擎、阅读进度自动保存
+- ✅ **EPUB/PDF 解析** - 支持 EPUB 内容解包和 PDF 文本、目录提取
+- ✅ **阅读器** - 基于 UIPageViewController 翻页、Core Text 分页引擎、进度拖动和阅读进度自动保存
+- ✅ **听书功能** - 支持系统语音朗读、暂停、语速和音调调节，并自动连续翻页
 - ✅ **目录导航** - 章节列表、当前章节高亮、快速跳转
 - ✅ **主题系统** - 4种主题（日间/夜间/羊皮纸/护眼）
 - ✅ **阅读设置** - 字体大小（12-32pt）、行间距（0-20pt）自定义，设置带去抖动优化
 - ✅ **字体管理** - 系统字体（PingFang SC/Heiti SC/Songti SC/Kaiti SC）+ 自定义字体导入（ttf/otf）
-- ✅ **文件导入** - 支持 iCloud Drive、本地文件、文件分享（`UIDocumentPickerViewController`）
-- ✅ **书签功能** - 添加/删除书签、书签列表、点击跳转、滑动删除（iOS 15+ swipeActions）
-- ✅ **分页缓存** - JSON 序列化缓存分页结果，版本控制，视图高度变化时自动失效
+- ✅ **文件导入** - 支持 TXT/EPUB/PDF 单个或批量导入，以及局域网 WiFi 传书
+- ✅ **书签功能** - 同章多书签、精确位置跳转、书签列表和滑动删除
+- ✅ **分页缓存** - 缓存目录存储、原子写入，并按版本、文件时间、视图尺寸和排版设置完整校验
 - ✅ **导入进度** - 导入中实时显示进度和加载动画
-- ✅ **iOS 13 兼容** - FullScreenCover、ActivityIndicator、书签删除等均兼容 iOS 13
+- ✅ **阅读统计** - 记录阅读时长、页数、连续阅读天数和分书统计
+- ✅ **iOS 15 基线** - 使用原生 fullScreenCover、ProgressView、UTType、dismiss 和 swipeActions
 
 ### 待实现功能
-- 📝 EPUB 格式支持
-- 📝 PDF 格式支持
 - 📝 笔记/高亮功能（数据模型已就绪）
 - 📝 全文搜索
 - 📝 iCloud 同步
@@ -70,8 +71,6 @@ BookReader/
     │           └── TXTParser.swift      # TXT 解析器（编码检测、章节正则匹配、50MB限制）
     │
     └── Presentation/                    # 表现层（MVVM）
-        ├── Components/
-        │   └── ActivityIndicator.swift  # iOS 13 兼容的加载指示器
         ├── ViewModels/
         │   ├── LibraryViewModel.swift   # 书架 ViewModel（加载/搜索/筛选/导入/删除）
         │   └── ReaderViewModel.swift    # 阅读器 ViewModel（Core Text 分页/翻页/进度/书签）
@@ -91,9 +90,9 @@ BookReader/
 ## 🚀 快速开始
 
 ### 环境要求
-- iOS 13.0+
-- Xcode 13.0+
-- Swift 5.9+
+- iOS 15.0+
+- Xcode 16.0+（单元测试使用 Swift Testing）
+- Swift 5 语言模式
 
 ### 运行项目
 
@@ -109,8 +108,8 @@ BookReader/
 ### 导入书籍
 
 1. 点击书架右上角 **+** 按钮
-2. 在文件选择器中选择 TXT 文件
-3. 系统自动检测编码（UTF-8/GBK/GB18030/Big5）并解析章节
+2. 选择单本或批量导入 TXT、EPUB、PDF 文件，也可以启动 WiFi 传书
+3. 系统按文件格式解析内容；TXT 会自动检测 UTF-8/GBK/GB18030/Big5 编码
 4. 导入完成后自动添加到书架
 
 ### 阅读书籍
@@ -147,7 +146,7 @@ BookReader/
 
 ```
 Presentation Layer (MVVM)
-    ↓  ViewModels 依赖 UseCases
+    ↓  ReaderViewModel 依赖 UseCases；LibraryViewModel 依赖 Repository 协议
 Domain Layer (Entities + UseCases + Repository Interfaces)
     ↓  Repository 实现依赖 Domain 层协议
 Data Layer (Repository Implementations + Core Data + Parsers)
@@ -156,8 +155,8 @@ Data Layer (Repository Implementations + Core Data + Parsers)
 ### 数据流
 
 ```
-View → ViewModel → UseCase → Repository → Core Data
-                ↘ TXTParser (文件导入时)
+View → ViewModel → UseCase/Repository 协议 → Repository → Core Data
+                ↘ TXTParser（文件导入时）
 ```
 
 ### 关键技术
@@ -176,9 +175,21 @@ View → ViewModel → UseCase → Repository → Core Data
 - **依赖注入**: ViewModel 通过协议接收 Repository，便于单元测试和替换实现
 - **响应式数据流**: Repository 层全部使用 `AnyPublisher` 返回，ViewModel 通过 Combine 订阅
 - **Core Data 线程安全**: 所有 CoreData 操作在 `context.perform` 块中执行
-- **分页缓存**: `PageCacheManager` 将分页结果序列化为 JSON 缓存，带版本号和视图高度校验
-- **编码检测**: TXTParser 支持 BOM → ASCII → 严格 UTF-8 → GB18030 → Big5 → UTF-8 兜底的检测链
+- **分页缓存**: `PageCacheManager` 将分页结果序列化为 JSON，完整校验视图尺寸、字体、字号、行距、布局和源文件时间
+- **编码检测**: TXTParser 优先识别 BOM，再对整文件依次尝试 UTF-8、GB18030 和 Big5，避免仅抽样文件头造成误判
 - **去抖动优化**: 字体大小和行间距设置带 0.15 秒去抖动，避免频繁触发 Core Text 重分页
+
+## 🧪 测试
+
+```bash
+xcodebuild test \
+  -project BookReader.xcodeproj \
+  -scheme BookReader \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+  -only-testing:BookReaderTests
+```
+
+当前单元测试覆盖默认书架筛选、TXT 编码回退与 UTF-16 偏移、分页缓存失效、超过 500 页的完整分页、单页进度，以及完成状态持久化；UI 测试包含主导航冒烟验证。
 
 ## 📁 文件清单
 
@@ -220,7 +231,7 @@ README.md                              # 本文件
 
 ## 📄 许可证
 
-MIT License
+仓库当前尚未提供独立许可证文件。
 
 ## 🤝 贡献
 

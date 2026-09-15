@@ -32,7 +32,7 @@ protocol BookRepositoryProtocol {
         bookId: UUID,
         chapterIndex: Int,
         contentOffset: Int,
-        readingStatus: ReadingStatus
+        isCompleted: Bool
     ) -> AnyPublisher<Void, Error>
     
     /// 切换收藏状态

@@ -6,14 +6,14 @@ struct BookmarkListView: View {
     let onSelect: (Bookmark) -> Void
     let onDelete: (Bookmark) -> Void
     
-    @Environment(\.presentationMode) var presentationMode
+    @Environment(\.dismiss) private var dismiss
     
     var body: some View {
         NavigationView {
             contentView
                 .navigationBarTitle("书签列表", displayMode: .inline)
                 .navigationBarItems(trailing: Button("完成") {
-                    presentationMode.wrappedValue.dismiss()
+                    dismiss()
                 })
         }
     }
@@ -50,42 +50,18 @@ struct BookmarkListView: View {
     }
     
     private func bookmarkRow(for bookmark: Bookmark) -> some View {
-        if #available(iOS 15.0, *) {
-            return Button(action: { onSelect(bookmark) }) {
-                BookmarkRowContent(
-                    bookmark: bookmark,
-                    chapterTitle: chapterTitle(for: bookmark.chapterIndex)
-                )
-            }
-            .buttonStyle(PlainButtonStyle())
-            .swipeActions(edge: .trailing) {
-                Button(role: .destructive) {
-                    onDelete(bookmark)
-                } label: {
-                    Label("删除", systemImage: "trash")
-                }
-            }
-        } else {
-            // Fallback on earlier versions
-            return HStack {
-                BookmarkRowContent(
-                    bookmark: bookmark,
-                    chapterTitle: chapterTitle(for: bookmark.chapterIndex)
-                )
-                
-                Spacer()
-                
-                Button(action: {
-                    onDelete(bookmark)
-                }) {
-                    Image(systemName: "trash")
-                        .foregroundColor(.red)
-                        .padding(.leading, 8)
-                }
-            }
-            .contentShape(Rectangle())
-            .onTapGesture {
-                onSelect(bookmark)
+        Button(action: { onSelect(bookmark) }) {
+            BookmarkRowContent(
+                bookmark: bookmark,
+                chapterTitle: chapterTitle(for: bookmark.chapterIndex)
+            )
+        }
+        .buttonStyle(PlainButtonStyle())
+        .swipeActions(edge: .trailing) {
+            Button(role: .destructive) {
+                onDelete(bookmark)
+            } label: {
+                Label("删除", systemImage: "trash")
             }
         }
     }

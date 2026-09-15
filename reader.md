@@ -3,7 +3,7 @@
 ## 项目概述
 - **项目名称**: NovelReader
 - **开发语言**: Swift 5.9+
-- **最低版本**: iOS 13.0+
+- **最低版本**: iOS 15.0+
 - **UI框架**: SwiftUI + UIKit 混编
 - **架构模式**: MVVM + Clean Architecture
 
@@ -15,7 +15,7 @@
 |------|----------|------|
 | **开发语言** | Swift 5.9+ | 现代Swift特性，性能优秀 |
 | **UI框架** | SwiftUI + UIKit 混编 | SwiftUI主导，UIKit处理复杂文本渲染 |
-| **最低版本** | iOS 13.0+ | 支持SwiftUI基础功能 |
+| **最低版本** | iOS 15.0+ | 使用 iOS 15 原生 SwiftUI 交互能力 |
 | **架构模式** | MVVM + Clean Architecture | 清晰分层，便于测试维护 |
 | **数据存储** | Core Data + UserDefaults | 书籍数据+用户配置 |
 | **依赖管理** | Swift Package Manager | Apple原生支持 |

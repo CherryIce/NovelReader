@@ -7,7 +7,7 @@ protocol SaveProgressUseCaseProtocol {
         bookId: UUID,
         chapterIndex: Int,
         contentOffset: Int,
-        readingStatus: ReadingStatus
+        isCompleted: Bool
     ) -> AnyPublisher<Void, Error>
 }
 
@@ -22,13 +22,13 @@ class SaveProgressUseCase: SaveProgressUseCaseProtocol {
         bookId: UUID,
         chapterIndex: Int,
         contentOffset: Int,
-        readingStatus: ReadingStatus
+        isCompleted: Bool
     ) -> AnyPublisher<Void, Error> {
         return bookRepository.updateReadingProgress(
             bookId: bookId,
             chapterIndex: chapterIndex,
             contentOffset: contentOffset,
-            readingStatus: readingStatus
+            isCompleted: isCompleted
         )
     }
 }

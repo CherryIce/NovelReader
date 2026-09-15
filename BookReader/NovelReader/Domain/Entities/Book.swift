@@ -60,11 +60,6 @@ struct Book: Identifiable, Codable, Equatable {
         self.readingStatus = readingStatus
     }
     
-    /// 计算全局阅读进度
-    var globalProgress: Double {
-        // 需要在有章节信息时计算
-        return 0
-    }
 }
 
 /// 阅读状态

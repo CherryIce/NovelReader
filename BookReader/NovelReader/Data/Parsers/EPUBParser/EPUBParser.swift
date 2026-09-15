@@ -21,7 +21,7 @@ class EPUBParser {
         if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
            let fileSize = attrs[.size] as? Int64,
            fileSize > maxFileSize {
-            throw ParserError.fileTooLarge(maxSize: fileSize)
+            throw ParserError.fileTooLarge(actualSize: fileSize)
         }
         
         // 3. 解压 EPUB 到临时目录
@@ -81,7 +81,7 @@ class EPUBParser {
             
             guard !trimmedContent.isEmpty else { continue }
             
-            let chapterLength = trimmedContent.count
+            let chapterLength = trimmedContent.utf16.count
             chapters.append(ParsedChapter(
                 index: chapters.count,
                 title: title,
@@ -383,7 +383,7 @@ class EPUBParser {
             let trimmedContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmedContent.isEmpty else { continue }
             
-            let length = trimmedContent.count
+            let length = trimmedContent.utf16.count
             chapters.append(ParsedChapter(
                 index: chapters.count,
                 title: title,
@@ -506,13 +506,13 @@ private class Archive {
                 
                 let filenameLen = cdData.withUnsafeBytes { ptr in
                     ptr.load(fromByteOffset: offset + 28, as: UInt16.self).littleEndian
-                })
+                }
                 let extraLen = cdData.withUnsafeBytes { ptr in
                     ptr.load(fromByteOffset: offset + 30, as: UInt16.self).littleEndian
-                })
+                }
                 let commentLen = cdData.withUnsafeBytes { ptr in
                     ptr.load(fromByteOffset: offset + 32, as: UInt16.self).littleEndian
-                })
+                }
                 offset += 46 + Int(filenameLen) + Int(extraLen) + Int(commentLen)
             }
         } catch {

@@ -1,5 +1,5 @@
 import SwiftUI
-import MobileCoreServices
+import UniformTypeIdentifiers
 
 struct LibraryView: View {
     @ObservedObject private var viewModel = LibraryViewModel()
@@ -9,10 +9,9 @@ struct LibraryView: View {
     @State private var showingWiFiTransfer = false
     @State private var sheetId = UUID()
     @State private var selectedBook: Book?
-    @State private var showingReader = false
     @State private var bookToDelete: Book?
     @State private var showingDeleteConfirmation = false
-    
+
     var body: some View {
         NavigationView {
             ZStack {
@@ -22,7 +21,9 @@ struct LibraryView: View {
             .navigationBarTitle("书架", displayMode: .automatic)
             .navigationBarItems(trailing: addButton)
             .sheet(isPresented: $showingDocumentPicker) {
-                DocumentPicker { url in
+                DocumentPicker(
+                    contentTypes: [.plainText, .pdf, UTType(filenameExtension: "epub") ?? .data]
+                ) { url in
                     viewModel.importBook(from: url)
                 }
             }
@@ -35,13 +36,9 @@ struct LibraryView: View {
                 WiFiTransferView()
             }
             .id(sheetId)
-            // 使用 UIKit 桥接实现全屏模态展示（iOS 13 兼容）
-            .background(
-                FullScreenCover(
-                    isPresented: $showingReader,
-                    selectedBook: $selectedBook
-                )
-            )
+            .fullScreenCover(item: $selectedBook) { book in
+                ReaderView(book: book)
+            }
             .alert(item: $viewModel.error, content: errorAlert)
             .actionSheet(isPresented: $showingDeleteConfirmation, content: deleteActionSheet)
             .onAppear {
@@ -51,20 +48,45 @@ struct LibraryView: View {
             .overlay(batchImportToast)
         }
     }
-    
+
     // MARK: - Subviews
-    
+
     private var backgroundLayer: some View {
         Color(.systemBackground)
-            .edgesIgnoringSafeArea(.all)
+            .ignoresSafeArea()
     }
-    
+
     private var contentLayer: some View {
         VStack(spacing: 0) {
+            searchBar
+            filterBar
             bookGrid
         }
     }
-    
+
+    private var searchBar: some View {
+        SearchBar(text: $viewModel.searchQuery)
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+    }
+
+    private var filterBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 12) {
+                ForEach(LibraryFilter.allCases) { filter in
+                    FilterButton(
+                        title: filter.displayName,
+                        isSelected: viewModel.currentFilter == filter
+                    ) {
+                        viewModel.setFilter(filter)
+                    }
+                }
+            }
+            .padding(.horizontal)
+        }
+        .padding(.vertical, 8)
+    }
+
     private var bookGrid: some View {
         Group {
             if viewModel.books.isEmpty && !viewModel.isImporting && !viewModel.isBatchImporting {
@@ -79,7 +101,12 @@ struct LibraryView: View {
                         : viewModel.importProgress,
                     onSelect: { book in
                         selectedBook = book
-                        showingReader = true
+                    },
+                    onToggleFavorite: { book in
+                        viewModel.toggleFavorite(book)
+                    },
+                    onToggleCompleted: { book in
+                        viewModel.toggleCompleted(book)
                     },
                     onDelete: { book in
                         bookToDelete = book
@@ -89,7 +116,7 @@ struct LibraryView: View {
             }
         }
     }
-    
+
     private var addButton: some View {
         Menu {
             Button(action: {
@@ -98,14 +125,14 @@ struct LibraryView: View {
             }) {
                 Label("导入书籍", systemImage: "doc.badge.plus")
             }
-            
+
             Button(action: {
                 sheetId = UUID()
                 showingBatchDocumentPicker = true
             }) {
                 Label("批量导入", systemImage: "doc.on.doc")
             }
-            
+
             Button(action: {
                 showingWiFiTransfer = true
             }) {
@@ -115,7 +142,7 @@ struct LibraryView: View {
             Image(systemName: "plus")
         }
     }
-    
+
     private func errorAlert(error: BookError) -> Alert {
         Alert(
             title: Text("错误"),
@@ -123,7 +150,7 @@ struct LibraryView: View {
             dismissButton: .default(Text("确定"))
         )
     }
-    
+
     private func deleteActionSheet() -> ActionSheet {
         ActionSheet(
             title: Text("确认删除"),
@@ -138,7 +165,7 @@ struct LibraryView: View {
             ]
         )
     }
-    
+
     private var successToast: some View {
         Group {
             if viewModel.importSuccess {
@@ -165,7 +192,7 @@ struct LibraryView: View {
             }
         }
     }
-    
+
     private var batchImportToast: some View {
         Group {
             if viewModel.batchImportSuccess {
@@ -211,8 +238,10 @@ struct BooksGridView: View {
     let importingTitle: String
     let importingProgress: String
     let onSelect: (Book) -> Void
+    let onToggleFavorite: (Book) -> Void
+    let onToggleCompleted: (Book) -> Void
     let onDelete: (Book) -> Void
-    
+
     var body: some View {
         GeometryReader { geometry in
             let columns: CGFloat = 3
@@ -221,7 +250,7 @@ struct BooksGridView: View {
             let itemWidth = (geometry.size.width - totalSpacing - 32) / columns
             let totalItems = books.count + (isImporting ? 1 : 0)
             let rowCount = Int(ceil(Double(totalItems) / Double(columns)))
-            
+
             ScrollView {
                 VStack(spacing: spacing) {
                     ForEach(0..<rowCount, id: \.self) { rowIndex in
@@ -234,6 +263,8 @@ struct BooksGridView: View {
                             importingProgress: importingProgress,
                             itemWidth: itemWidth,
                             onSelect: onSelect,
+                            onToggleFavorite: onToggleFavorite,
+                            onToggleCompleted: onToggleCompleted,
                             onDelete: onDelete
                         )
                     }
@@ -255,8 +286,10 @@ struct BookRowView: View {
     let importingProgress: String
     let itemWidth: CGFloat
     let onSelect: (Book) -> Void
+    let onToggleFavorite: (Book) -> Void
+    let onToggleCompleted: (Book) -> Void
     let onDelete: (Book) -> Void
-    
+
     var body: some View {
         HStack(spacing: 16) {
             ForEach(0..<columns, id: \.self) { columnIndex in
@@ -269,6 +302,8 @@ struct BookRowView: View {
                     importingProgress: importingProgress,
                     itemWidth: itemWidth,
                     onSelect: onSelect,
+                    onToggleFavorite: onToggleFavorite,
+                    onToggleCompleted: onToggleCompleted,
                     onDelete: onDelete
                 )
             }
@@ -286,8 +321,10 @@ struct BookGridItem: View {
     let importingProgress: String
     let itemWidth: CGFloat
     let onSelect: (Book) -> Void
+    let onToggleFavorite: (Book) -> Void
+    let onToggleCompleted: (Book) -> Void
     let onDelete: (Book) -> Void
-    
+
     var body: some View {
         Group {
             if index < books.count {
@@ -297,6 +334,18 @@ struct BookGridItem: View {
                         onSelect(books[index])
                     }
                     .contextMenu {
+                        Button(action: { onToggleFavorite(books[index]) }) {
+                            HStack {
+                                Image(systemName: books[index].isFavorite ? "heart.slash" : "heart")
+                                Text(books[index].isFavorite ? "取消收藏" : "收藏")
+                            }
+                        }
+                        Button(action: { onToggleCompleted(books[index]) }) {
+                            HStack {
+                                Image(systemName: books[index].readingStatus == .completed ? "arrow.uturn.backward" : "checkmark.circle")
+                                Text(books[index].readingStatus == .completed ? "标记为在读" : "标记为已读完")
+                            }
+                        }
                         Button(action: { onDelete(books[index]) }) {
                             HStack {
                                 Image(systemName: "trash")
@@ -319,9 +368,52 @@ struct BookGridItem: View {
 
 // MARK: - 子视图
 
+struct SearchBar: View {
+    @Binding var text: String
+
+    var body: some View {
+        HStack {
+            Image(systemName: "magnifyingglass")
+                .foregroundColor(.gray)
+
+            TextField("搜索书籍", text: $text)
+                .textFieldStyle(PlainTextFieldStyle())
+
+            if !text.isEmpty {
+                Button(action: { text = "" }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(.gray)
+                }
+            }
+        }
+        .padding(10)
+        .background(Color(.systemGray6))
+        .cornerRadius(10)
+    }
+}
+
+struct FilterButton: View {
+    let title: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.subheadline)
+                .fontWeight(isSelected ? .semibold : .regular)
+                .foregroundColor(isSelected ? .white : .primary)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(isSelected ? Color.blue : Color(.systemGray6))
+                .cornerRadius(16)
+        }
+    }
+}
+
 struct BookCell: View {
     let book: Book
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             // 封面
@@ -329,7 +421,7 @@ struct BookCell: View {
                 RoundedRectangle(cornerRadius: 8)
                     .fill(Color.blue.opacity(0.15))
                     .aspectRatio(3/4, contentMode: .fit)
-                
+
                 if let coverPath = book.coverImagePath,
                    let image = UIImage(contentsOfFile: coverPath) {
                     Image(uiImage: image)
@@ -345,7 +437,7 @@ struct BookCell: View {
                         .multilineTextAlignment(.center) // 建议：多行文本内部也居中
                         .padding(8) // 建议：增加内边距，防止文字贴边
                 }
-                
+
                 // 已读完标识
                 if book.readingStatus == .completed {
                     Text("已读完")
@@ -364,6 +456,30 @@ struct BookCell: View {
                 RoundedRectangle(cornerRadius: 8)
                     .stroke(Color.gray.opacity(0.2), lineWidth: 1)
             )
+            .overlay(
+                Group {
+                    if book.isFavorite {
+                        Image(systemName: "heart.fill")
+                            .font(.caption)
+                            .foregroundColor(.red)
+                            .padding(6)
+                    }
+                },
+                alignment: .topTrailing
+            )
+
+            // 书名
+            Text(book.title)
+                .font(.caption)
+                .fontWeight(.medium)
+                .lineLimit(1)
+                .foregroundColor(.primary)
+
+            if book.readingStatus == .completed {
+                Text("已读完")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
         }
     }
 }
@@ -373,7 +489,7 @@ struct BookCell: View {
 struct ImportingBookCell: View {
     let title: String
     let progress: String
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             // 封面占位
@@ -381,10 +497,11 @@ struct ImportingBookCell: View {
                 RoundedRectangle(cornerRadius: 8)
                     .fill(Color(.systemGray5))
                     .aspectRatio(3/4, contentMode: .fit)
-                
+
                 VStack(spacing: 8) {
-                    ActivityIndicator(isAnimating: true, style: .medium)
-                    
+                    ProgressView()
+                        .progressViewStyle(CircularProgressViewStyle())
+
                     Text(progress)
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -395,7 +512,7 @@ struct ImportingBookCell: View {
                 RoundedRectangle(cornerRadius: 8)
                     .stroke(Color.blue.opacity(0.3), lineWidth: 1.5)
             )
-            
+
             // 书名
             Text(title)
                 .font(.caption)
@@ -412,11 +529,11 @@ struct EmptyLibraryView: View {
             Image(systemName: "books.vertical")
                 .font(.system(size: 60))
                 .foregroundColor(.gray)
-            
+
             Text("书架是空的")
                 .font(.headline)
                 .foregroundColor(.secondary)
-            
+
             Text("点击右上角 + 导入书籍")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
@@ -430,7 +547,7 @@ struct EmptyLibraryView: View {
 struct WiFiTransferView: View {
     @ObservedObject var wifiService = WiFiTransferService.shared
     @State private var showingHelp = false
-    
+
     var body: some View {
         NavigationView {
             VStack(spacing: 24) {
@@ -440,25 +557,25 @@ struct WiFiTransferView: View {
                         Circle()
                             .fill(wifiService.isRunning ? Color.green.opacity(0.15) : Color.gray.opacity(0.1))
                             .frame(width: 100, height: 100)
-                        
+
                         Image(systemName: wifiService.isRunning ? "wifi" : "wifi.slash")
                             .font(.system(size: 40))
                             .foregroundColor(wifiService.isRunning ? .green : .gray)
                     }
-                    
+
                     Text(wifiService.isRunning ? "传书服务已开启" : "传书服务未开启")
                         .font(.headline)
                         .foregroundColor(wifiService.isRunning ? .green : .secondary)
                 }
                 .padding(.top, 20)
-                
+
                 // 地址显示
                 if wifiService.isRunning, let url = wifiService.serverURL {
                     VStack(spacing: 12) {
                         Text("在电脑浏览器中访问以下地址")
                             .font(.subheadline)
                             .foregroundColor(.secondary)
-                        
+
                         // 地址卡片
                         HStack {
                             Image(systemName: "link")
@@ -471,7 +588,7 @@ struct WiFiTransferView: View {
                         .padding(16)
                         .background(Color(.systemGray6))
                         .cornerRadius(12)
-                        
+
                         Button(action: {
                             UIPasteboard.general.string = url
                         }) {
@@ -485,7 +602,7 @@ struct WiFiTransferView: View {
                     }
                     .padding(.horizontal, 24)
                 }
-                
+
                 // 上传统计
                 if wifiService.isRunning && wifiService.uploadedCount > 0 {
                     HStack(spacing: 16) {
@@ -494,14 +611,14 @@ struct WiFiTransferView: View {
                     }
                     .padding(.horizontal, 24)
                 }
-                
+
                 // 上传日志
                 if wifiService.isRunning && !wifiService.uploadLog.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("传输记录")
                             .font(.caption)
                             .foregroundColor(.secondary)
-                        
+
                         ScrollView {
                             VStack(alignment: .leading, spacing: 4) {
                                 ForEach(wifiService.uploadLog.reversed(), id: \.self) { log in
@@ -518,9 +635,9 @@ struct WiFiTransferView: View {
                     }
                     .padding(.horizontal, 24)
                 }
-                
+
                 Spacer()
-                
+
                 // 底部操作按钮
                 VStack(spacing: 12) {
                     Button(action: {
@@ -542,7 +659,7 @@ struct WiFiTransferView: View {
                         .foregroundColor(.white)
                         .cornerRadius(12)
                     }
-                    
+
                     if !wifiService.isRunning {
                         Button(action: { showingHelp = true }) {
                             HStack(spacing: 6) {
@@ -581,13 +698,13 @@ struct StatItem: View {
     let title: String
     let value: String
     let icon: String
-    
+
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: icon)
                 .foregroundColor(.blue)
                 .font(.title3)
-            
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                     .font(.caption)
@@ -596,7 +713,7 @@ struct StatItem: View {
                     .font(.title3)
                     .fontWeight(.semibold)
             }
-            
+
             Spacer()
         }
         .padding(16)
@@ -613,84 +730,16 @@ extension Notification.Name {
 
 // MARK: - Previews
 
-// MARK: - Full Screen Cover (iOS 13 兼容)
-
-struct FullScreenCover: UIViewControllerRepresentable {
-    @Binding var isPresented: Bool
-    @Binding var selectedBook: Book?
-    
-    func makeCoordinator() -> Coordinator {
-        Coordinator(self)
-    }
-    
-    func makeUIViewController(context: Context) -> UIViewController {
-        let controller = UIViewController()
-        controller.view.backgroundColor = .clear
-        return controller
-    }
-    
-    func updateUIViewController(_ uiViewController: UIViewController, context: Context) {
-        context.coordinator.update(uiViewController: uiViewController, isPresented: isPresented, selectedBook: selectedBook)
-    }
-    
-    class Coordinator: NSObject, UIAdaptivePresentationControllerDelegate {
-        var parent: FullScreenCover
-        var isDismissing = false
-        
-        init(_ parent: FullScreenCover) {
-            self.parent = parent
-            super.init()
-        }
-        
-        func update(uiViewController: UIViewController, isPresented: Bool, selectedBook: Book?) {
-            if isPresented {
-                if uiViewController.presentedViewController == nil && !isDismissing {
-                    guard let book = selectedBook else { return }
-                    let readerView = ReaderView(book: book)
-                    let hostingController = UIHostingController(rootView: readerView)
-                    hostingController.modalPresentationStyle = .fullScreen
-                    
-                    // 监听 dismiss 事件
-                    hostingController.presentationController?.delegate = self
-                    
-                    uiViewController.present(hostingController, animated: true)
-                }
-            } else {
-                if let presented = uiViewController.presentedViewController, !isDismissing {
-                    isDismissing = true
-                    presented.dismiss(animated: true) { [weak self] in
-                        self?.isDismissing = false
-                    }
-                }
-            }
-        }
-        
-        // MARK: - UIAdaptivePresentationControllerDelegate
-        
-        func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
-            // 当用户通过手势或点击背景关闭时，同步状态
-            parent.isPresented = false
-            parent.selectedBook = nil
-            isDismissing = false
-        }
-    }
-}
-
 // MARK: - Document Picker
 
 struct DocumentPicker: UIViewControllerRepresentable {
+    let contentTypes: [UTType]
     let onPick: (URL) -> Void
 
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        // 支持 TXT、EPUB、PDF 三种格式
-        let supportedTypes: [String] = [
-            kUTTypeText as String,           // public.plain-text (TXT)
-            "org.idpf.epub-container",       // EPUB
-            "com.adobe.pdf"                 // PDF
-        ]
         let picker = UIDocumentPickerViewController(
-            documentTypes: supportedTypes,
-            in: .open
+            forOpeningContentTypes: contentTypes,
+            asCopy: false
         )
         picker.delegate = context.coordinator
         picker.allowsMultipleSelection = false
@@ -729,14 +778,14 @@ struct BatchDocumentPicker: UIViewControllerRepresentable {
     let onPick: ([URL]) -> Void
 
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        let supportedTypes: [String] = [
-            kUTTypeText as String,
-            "org.idpf.epub-container",
-            "com.adobe.pdf"
+        let supportedTypes: [UTType] = [
+            .plainText,
+            .pdf,
+            UTType(filenameExtension: "epub") ?? .data
         ]
         let picker = UIDocumentPickerViewController(
-            documentTypes: supportedTypes,
-            in: .open
+            forOpeningContentTypes: supportedTypes,
+            asCopy: false
         )
         picker.delegate = context.coordinator
         picker.allowsMultipleSelection = true
