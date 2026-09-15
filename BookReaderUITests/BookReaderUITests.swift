@@ -25,6 +25,7 @@ final class BookReaderUITests: XCTestCase {
     @MainActor
     func testPrimaryTabsNavigate() throws {
         let app = XCUIApplication()
+        app.launchArguments = ["-hasCompletedOnboarding", "YES"]
         app.launch()
 
         let tabBar = app.tabBars.firstMatch

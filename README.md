@@ -75,7 +75,8 @@ BookReader/
         │   ├── LibraryViewModel.swift   # 书架 ViewModel（加载/搜索/筛选/导入/删除）
         │   └── ReaderViewModel.swift    # 阅读器 ViewModel（Core Text 分页/翻页/进度/书签）
         └── Views/
-            ├── ContentView.swift        # 根视图（TabView：书架/搜索/设置）
+            ├── ContentView.swift        # 根视图（首次引导门控 + 主 TabView）
+            ├── OnboardingView.swift     # 三页首次使用引导
             ├── Library/
             │   └── LibraryView.swift    # 书架视图（搜索栏/筛选栏/书籍网格/导入/删除）
             ├── Reader/
@@ -197,9 +198,8 @@ xcodebuild test \
 BookReader/
 ├── AppDelegate.swift                  # 应用入口
 ├── SceneDelegate.swift                # 场景管理
-├── Info.plist                         # 应用配置
-├── Assets.xcassets/                   # 资源目录
-├── Base.lproj/LaunchScreen.storyboard # 启动画面
+├── Info.plist                         # 应用配置与 UILaunchScreen 启动页
+├── Assets.xcassets/                   # AppIcon、启动标记与引导插画
 ├── BookReader.xcdatamodeld/           # Core Data 模型
 └── NovelReader/                       # 源代码（见上方项目结构）
 
