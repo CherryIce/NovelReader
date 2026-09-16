@@ -11,7 +11,7 @@ struct BookmarkListView: View {
     var body: some View {
         NavigationView {
             contentView
-                .navigationBarTitle("书签列表", displayMode: .inline)
+                .navigationBarTitle("书签", displayMode: .inline)
                 .navigationBarItems(trailing: Button("完成") {
                     dismiss()
                 })
@@ -20,7 +20,7 @@ struct BookmarkListView: View {
     
     @ViewBuilder
     private var contentView: some View {
-        if bookmarks.isEmpty {
+        if regularBookmarks.isEmpty {
             emptyView
         } else {
             bookmarkList
@@ -35,7 +35,7 @@ struct BookmarkListView: View {
             Text("暂无书签")
                 .font(.headline)
                 .foregroundColor(.secondary)
-            Text("阅读时点击书签图标可添加")
+            Text("阅读时点击书签按钮，可记录当前阅读位置")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
         }
@@ -43,12 +43,16 @@ struct BookmarkListView: View {
     
     private var bookmarkList: some View {
         List {
-            ForEach(bookmarks, id: \.id) { bookmark in
+            ForEach(regularBookmarks, id: \.id) { bookmark in
                 bookmarkRow(for: bookmark)
             }
         }
     }
-    
+
+    private var regularBookmarks: [Bookmark] {
+        bookmarks.filter { $0.type == .bookmark }
+    }
+
     private func bookmarkRow(for bookmark: Bookmark) -> some View {
         Button(action: { onSelect(bookmark) }) {
             BookmarkRowContent(
@@ -65,7 +69,7 @@ struct BookmarkListView: View {
             }
         }
     }
-    
+
     private func chapterTitle(for index: Int) -> String {
         guard index >= 0 && index < chapters.count else {
             return "未知章节"
@@ -81,19 +85,29 @@ struct BookmarkRowContent: View {
     let chapterTitle: String
     
     var body: some View {
-        HStack {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: iconName)
+                .foregroundColor(iconColor)
+                .frame(width: 20)
+
             VStack(alignment: .leading, spacing: 4) {
-                Text(chapterTitle)
-                    .font(.subheadline)
-                    .fontWeight(.medium)
-                    .foregroundColor(.primary)
-                    .lineLimit(1)
-                
-                if let preview = bookmark.selectedText {
-                    Text(String(preview.prefix(40)) + "...")
+                HStack {
+                    Text(chapterTitle)
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+
+                    Text(typeTitle)
+                        .font(.caption2)
+                        .foregroundColor(iconColor)
+                }
+
+                if let preview = bookmark.selectedText, !preview.isEmpty {
+                    Text(preview.count > 40 ? String(preview.prefix(40)) + "…" : preview)
                         .font(.caption)
                         .foregroundColor(.secondary)
-                        .lineLimit(1)
+                        .lineLimit(2)
                 }
                 
                 Text(formatDate(bookmark.createdAt))
@@ -106,7 +120,20 @@ struct BookmarkRowContent: View {
             Image(systemName: "chevron.right")
                 .font(.caption)
                 .foregroundColor(.gray)
+                .padding(.top, 4)
         }
+    }
+
+    private var iconName: String {
+        "bookmark.fill"
+    }
+
+    private var iconColor: Color {
+        .accentColor
+    }
+
+    private var typeTitle: String {
+        "书签"
     }
     
     private func formatDate(_ date: Date) -> String {

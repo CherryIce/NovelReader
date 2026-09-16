@@ -170,6 +170,216 @@ struct BookReaderTests {
         #expect(pages.map(\.content).joined() == content)
     }
 
+    @Test func readerSelectionUsesStableUTF16OffsetsAcrossPages() throws {
+        let pages = [
+            Page(
+                globalIndex: 0,
+                content: "甲😀乙丙",
+                chapterIndex: 0,
+                chapterTitle: "正文",
+                isChapterStart: true,
+                contentOffset: 0
+            ),
+            Page(
+                globalIndex: 1,
+                content: "丁戊己庚",
+                chapterIndex: 0,
+                chapterTitle: "正文",
+                isChapterStart: false,
+                contentOffset: 5
+            )
+        ]
+        let selection = ReaderTextSelection(
+            chapterIndex: 0,
+            anchorOffset: 8,
+            focusOffset: 1
+        )
+
+        let selectedParts = try pages.compactMap { page -> String? in
+            guard let range = selection.localRange(in: page) else { return nil }
+            return (page.content as NSString).substring(with: range)
+        }
+
+        #expect(selection.range == NSRange(location: 1, length: 7))
+        #expect(selectedParts.joined() == "😀乙丙丁戊己")
+    }
+
+    @Test func readerSelectionStartsOnAWholeUnicodeCharacter() {
+        let range = ReaderTextRangeMath.initialRange(in: "甲😀乙", utf16Offset: 1)
+        let lowerBoundary = ReaderTextRangeMath.composedCharacterBoundary(
+            in: "甲😀乙",
+            utf16Offset: 2,
+            preferUpperBoundary: false
+        )
+        let upperBoundary = ReaderTextRangeMath.composedCharacterBoundary(
+            in: "甲😀乙",
+            utf16Offset: 2,
+            preferUpperBoundary: true
+        )
+
+        #expect(range == NSRange(location: 1, length: 2))
+        #expect(("甲😀乙" as NSString).substring(with: range) == "😀")
+        #expect(lowerBoundary == 1)
+        #expect(upperBoundary == 3)
+    }
+
+    @Test func annotationRenderingTrimsIndentationAndResolvesOverlaps() throws {
+        let visibleRange = try #require(
+            ReaderTextRangeMath.trimmingLineWhitespace(
+                in: "　　正 文　 ",
+                range: NSRange(location: 0, length: 7)
+            )
+        )
+        let blankRange = ReaderTextRangeMath.trimmingLineWhitespace(
+            in: "　 \n",
+            range: NSRange(location: 0, length: 3)
+        )
+        let persistedMarks = [
+            ReaderTextMark(range: NSRange(location: 2, length: 5), style: .highlight),
+            ReaderTextMark(range: NSRange(location: 4, length: 4), style: .note)
+        ]
+        let resolvedMarks = ReaderTextRangeMath.resolvedMarks(
+            pageLength: 12,
+            persistedMarks: persistedMarks,
+            activeRange: NSRange(location: 1, length: 8)
+        )
+        let uncoveredRanges = ReaderTextRangeMath.uncoveredRanges(
+            in: NSRange(location: 1, length: 8),
+            coveredRanges: persistedMarks.map(\.range)
+        )
+
+        #expect(("　　正 文　 " as NSString).substring(with: visibleRange) == "正 文")
+        #expect(blankRange == nil)
+        #expect(resolvedMarks == [
+            ReaderTextMark(range: NSRange(location: 1, length: 1), style: .active),
+            ReaderTextMark(range: NSRange(location: 2, length: 2), style: .highlight),
+            ReaderTextMark(range: NSRange(location: 4, length: 4), style: .note),
+            ReaderTextMark(range: NSRange(location: 8, length: 1), style: .active)
+        ])
+        #expect(uncoveredRanges == [
+            NSRange(location: 1, length: 1),
+            NSRange(location: 8, length: 1)
+        ])
+    }
+
+    @Test func readerTapTargetsAreMutuallyExclusive() {
+        #expect(
+            ReaderPageTapRouting.target(
+                isToolbarSafeArea: true,
+                isAnnotationHit: true,
+                isCenterTap: true
+            ) == .toolbar
+        )
+        #expect(
+            ReaderPageTapRouting.target(
+                isToolbarSafeArea: false,
+                isAnnotationHit: true,
+                isCenterTap: true
+            ) == .annotation
+        )
+        #expect(
+            ReaderPageTapRouting.target(
+                isToolbarSafeArea: false,
+                isAnnotationHit: false,
+                isCenterTap: true
+            ) == .toolbar
+        )
+        #expect(
+            ReaderPageTapRouting.target(
+                isToolbarSafeArea: false,
+                isAnnotationHit: false,
+                isCenterTap: false
+            ) == .none
+        )
+    }
+
+    @Test func noteAnnotationPersistsItsSelectedRangeAndComment() async throws {
+        let persistence = PersistenceController(inMemory: true)
+        let bookRepository = BookRepository(context: persistence.container.newBackgroundContext())
+        let bookmarkRepository = BookmarkRepository(context: persistence.container.newBackgroundContext())
+        let book = Book(title: "批注测试", filePath: "/tmp/annotation.txt", format: .txt)
+        let note = Bookmark(
+            bookId: book.id,
+            chapterIndex: 2,
+            location: 18,
+            length: 7,
+            type: .note,
+            note: "这一段很重要",
+            selectedText: "被选择的原文"
+        )
+
+        _ = try await publisherValue(bookRepository.addBook(book))
+        _ = try await publisherValue(bookmarkRepository.addBookmark(note))
+        let saved = try #require(
+            try await publisherValue(bookmarkRepository.getBookmarks(forBookId: book.id)).first
+        )
+
+        #expect(saved.chapterIndex == 2)
+        #expect(saved.location == 18)
+        #expect(saved.length == 7)
+        #expect(saved.type == .note)
+        #expect(saved.note == "这一段很重要")
+        #expect(saved.selectedText == "被选择的原文")
+    }
+
+    @Test func annotationDetailGroupsAndManagesUpToFiveThoughts() async throws {
+        let persistence = PersistenceController(inMemory: true)
+        let bookRepository = BookRepository(context: persistence.container.newBackgroundContext())
+        let bookmarkRepository = BookmarkRepository(context: persistence.container.newBackgroundContext())
+        let book = Book(title: "想法管理测试", filePath: "/tmp/thoughts.txt", format: .txt)
+        let highlight = Bookmark(
+            bookId: book.id,
+            chapterIndex: 1,
+            location: 12,
+            length: 6,
+            type: .highlight,
+            selectedText: "划线原文"
+        )
+
+        _ = try await publisherValue(bookRepository.addBook(book))
+        _ = try await publisherValue(bookmarkRepository.addBookmark(highlight))
+
+        for index in 1...ReaderAnnotationGroup.maximumThoughtCount {
+            let thought = Bookmark(
+                bookId: book.id,
+                chapterIndex: highlight.chapterIndex,
+                location: highlight.location,
+                length: highlight.length,
+                type: .note,
+                note: "想法 \(index)",
+                selectedText: highlight.selectedText
+            )
+            _ = try await publisherValue(bookmarkRepository.addBookmark(thought))
+        }
+
+        let savedRecords = try await publisherValue(
+            bookmarkRepository.getBookmarks(forBookId: book.id)
+        )
+        let fullGroup = try #require(ReaderAnnotationGroup.groups(from: savedRecords).first)
+
+        #expect(fullGroup.selectedText == "划线原文")
+        #expect(fullGroup.records.count == 6)
+        #expect(fullGroup.thoughts.count == ReaderAnnotationGroup.maximumThoughtCount)
+        #expect(!fullGroup.canAddThought)
+
+        var editedThought = try #require(fullGroup.thoughts.first)
+        editedThought.note = "修改后的想法"
+        editedThought.updatedAt = Date()
+        _ = try await publisherValue(bookmarkRepository.updateBookmark(editedThought))
+        _ = try await publisherValue(
+            bookmarkRepository.deleteBookmark(byId: try #require(fullGroup.thoughts.last).id)
+        )
+
+        let updatedRecords = try await publisherValue(
+            bookmarkRepository.getBookmarks(forBookId: book.id)
+        )
+        let updatedGroup = try #require(ReaderAnnotationGroup.groups(from: updatedRecords).first)
+
+        #expect(updatedGroup.thoughts.count == 4)
+        #expect(updatedGroup.canAddThought)
+        #expect(updatedGroup.thoughts.contains { $0.note == "修改后的想法" })
+    }
+
     @Test func completedStatusSurvivesReadingAnEarlierPage() async throws {
         let persistence = PersistenceController(inMemory: true)
         let repository = BookRepository(context: persistence.container.newBackgroundContext())

@@ -28,6 +28,14 @@ class ReaderViewModel: ObservableObject {
     @Published var isCurrentPageBookmarked: Bool = false
     @Published var showBookmarkList: Bool = false
     @Published var bookmarkList: [Bookmark] = []
+    @Published private(set) var readerAnnotations: [Bookmark] = []
+    @Published private(set) var activeSelection: ReaderTextSelection?
+    @Published var showSelectionActions: Bool = false
+    @Published var showCommentComposer: Bool = false
+    @Published var commentDraft: String = ""
+    @Published private(set) var isSavingSelection: Bool = false
+    @Published var presentedAnnotationKey: ReaderAnnotationKey?
+    @Published private(set) var isSavingAnnotationThought: Bool = false
 
     /// pages 数组版本号，每次重分页时递增，用于通知 UIPageViewController 强制刷新
     @Published var pagesVersion: Int = 0
@@ -266,6 +274,7 @@ class ReaderViewModel: ObservableObject {
                 },
                 receiveValue: { [weak self] bookmarks in
                     self?.currentBookmarks = bookmarks
+                    self?.refreshBookmarkState()
                     self?.checkCurrentPageBookmark()
                 }
             )
@@ -491,6 +500,453 @@ class ReaderViewModel: ObservableObject {
         isPaused = false
     }
 
+    // MARK: - 文本选择与批注
+
+    var selectedText: String? {
+        guard let selection = activeSelection,
+              !selection.isEmpty,
+              let chapter = chapters[safe: selection.chapterIndex] else {
+            return nil
+        }
+
+        let content = chapter.content as NSString
+        let range = NSIntersectionRange(
+            selection.range,
+            NSRange(location: 0, length: content.length)
+        )
+        guard range.length > 0 else { return nil }
+        return content.substring(with: range)
+    }
+
+    var canHighlightSelection: Bool {
+        guard let selection = activeSelection else { return false }
+        return !uncoveredRanges(for: selection).isEmpty
+    }
+
+    var canAddThoughtToSelection: Bool {
+        guard let selection = activeSelection else { return false }
+        return annotationGroup(containing: selection)?.canAddThought ?? true
+    }
+
+    func beginSelection(chapterIndex: Int, contentOffset: Int) {
+        guard let chapter = chapters[safe: chapterIndex] else { return }
+        let contentLength = (chapter.content as NSString).length
+        guard contentLength > 0 else { return }
+
+        let initialRange = ReaderTextRangeMath.initialRange(
+            in: chapter.content,
+            utf16Offset: contentOffset
+        )
+        guard initialRange.length > 0 else { return }
+
+        activeSelection = ReaderTextSelection(
+            chapterIndex: chapterIndex,
+            anchorOffset: initialRange.location,
+            focusOffset: NSMaxRange(initialRange)
+        )
+        showToolbar = false
+        showSelectionActions = false
+    }
+
+    func updateSelectionFocus(chapterIndex: Int, contentOffset: Int) {
+        guard var selection = activeSelection,
+              selection.chapterIndex == chapterIndex,
+              let chapter = chapters[safe: chapterIndex] else {
+            return
+        }
+
+        let contentLength = (chapter.content as NSString).length
+        let clampedOffset = min(max(contentOffset, 0), contentLength)
+        selection.focusOffset = ReaderTextRangeMath.composedCharacterBoundary(
+            in: chapter.content,
+            utf16Offset: clampedOffset,
+            preferUpperBoundary: clampedOffset >= selection.anchorOffset
+        )
+        activeSelection = selection
+    }
+
+    func updateSelectionStart(chapterIndex: Int, contentOffset: Int) {
+        guard let selection = activeSelection,
+              selection.chapterIndex == chapterIndex,
+              let chapter = chapters[safe: chapterIndex] else {
+            return
+        }
+
+        let end = selection.upperBound
+        let requestedStart = min(max(contentOffset, 0), max(0, end - 1))
+        let start = ReaderTextRangeMath.composedCharacterBoundary(
+            in: chapter.content,
+            utf16Offset: requestedStart,
+            preferUpperBoundary: false
+        )
+        activeSelection = ReaderTextSelection(
+            chapterIndex: chapterIndex,
+            anchorOffset: start,
+            focusOffset: end
+        )
+    }
+
+    func updateSelectionEnd(chapterIndex: Int, contentOffset: Int) {
+        guard let selection = activeSelection,
+              selection.chapterIndex == chapterIndex,
+              let chapter = chapters[safe: chapterIndex] else {
+            return
+        }
+
+        let contentLength = (chapter.content as NSString).length
+        let start = selection.lowerBound
+        let requestedEnd = max(min(contentOffset, contentLength), min(contentLength, start + 1))
+        let end = ReaderTextRangeMath.composedCharacterBoundary(
+            in: chapter.content,
+            utf16Offset: requestedEnd,
+            preferUpperBoundary: true
+        )
+        activeSelection = ReaderTextSelection(
+            chapterIndex: chapterIndex,
+            anchorOffset: start,
+            focusOffset: end
+        )
+    }
+
+    func finishSelection() {
+        guard activeSelection?.isEmpty == false else {
+            cancelSelection()
+            return
+        }
+        showSelectionActions = true
+    }
+
+    func cancelSelection() {
+        activeSelection = nil
+        showSelectionActions = false
+        showCommentComposer = false
+        commentDraft = ""
+        isSavingSelection = false
+    }
+
+    func beginWritingComment() {
+        guard activeSelection?.isEmpty == false else { return }
+        guard canAddThoughtToSelection else {
+            bookmarkAlert = BookmarkAlert(
+                title: "想法数量已达上限",
+                message: "每段划线最多可以保存 \(ReaderAnnotationGroup.maximumThoughtCount) 条想法"
+            )
+            return
+        }
+        commentDraft = ""
+        showSelectionActions = false
+        showCommentComposer = true
+    }
+
+    func cancelWritingComment() {
+        showCommentComposer = false
+        showSelectionActions = activeSelection?.isEmpty == false
+    }
+
+    func copySelection() {
+        guard let selectedText else { return }
+        UIPasteboard.general.string = selectedText
+        cancelSelection()
+    }
+
+    func saveSelectionAsHighlight() {
+        guard let selection = activeSelection else { return }
+        let ranges = uncoveredRanges(for: selection)
+        guard !ranges.isEmpty else { return }
+        persistActiveSelection(type: .highlight, note: nil, ranges: ranges)
+    }
+
+    func saveSelectionComment() {
+        let note = commentDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !note.isEmpty, let selection = activeSelection else { return }
+
+        if let group = annotationGroup(containing: selection) {
+            guard group.canAddThought else {
+                bookmarkAlert = BookmarkAlert(
+                    title: "想法数量已达上限",
+                    message: "每段划线最多可以保存 \(ReaderAnnotationGroup.maximumThoughtCount) 条想法"
+                )
+                return
+            }
+            persistActiveSelection(type: .note, note: note, ranges: [group.key.range])
+        } else {
+            persistActiveSelection(type: .note, note: note)
+        }
+    }
+
+    func selectionMarks(for page: Page) -> [ReaderTextMark] {
+        let pageLength = (page.content as NSString).length
+        let persistedMarks = readerAnnotations.compactMap { bookmark -> ReaderTextMark? in
+            guard bookmark.chapterIndex == page.chapterIndex,
+                  bookmark.length > 0,
+                  let localRange = ReaderTextRangeMath.localIntersection(
+                    selectionRange: NSRange(location: bookmark.location, length: bookmark.length),
+                    pageOffset: page.contentOffset,
+                    pageLength: pageLength
+                  ) else {
+                return nil
+            }
+
+            return ReaderTextMark(
+                range: localRange,
+                style: bookmark.type == .note ? .note : .highlight
+            )
+        }
+
+        return ReaderTextRangeMath.resolvedMarks(
+            pageLength: pageLength,
+            persistedMarks: persistedMarks,
+            activeRange: activeSelection?.localRange(in: page)
+        )
+    }
+
+    private func uncoveredRanges(for selection: ReaderTextSelection) -> [NSRange] {
+        guard let chapter = chapters[safe: selection.chapterIndex] else { return [] }
+        let coveredRanges = readerAnnotations.compactMap { annotation -> NSRange? in
+            guard annotation.chapterIndex == selection.chapterIndex,
+                  annotation.length > 0 else {
+                return nil
+            }
+            return NSRange(location: annotation.location, length: annotation.length)
+        }
+        return ReaderTextRangeMath.uncoveredRanges(
+            in: selection.range,
+            coveredRanges: coveredRanges
+        )
+        .compactMap {
+            ReaderTextRangeMath.trimmingLineWhitespace(in: chapter.content, range: $0)
+        }
+    }
+
+    private func persistActiveSelection(
+        type: BookmarkType,
+        note: String?,
+        ranges: [NSRange]? = nil
+    ) {
+        guard let selection = activeSelection,
+              !selection.isEmpty,
+              let chapter = chapters[safe: selection.chapterIndex] else {
+            return
+        }
+
+        let content = chapter.content as NSString
+        let rangesToSave = ranges ?? [selection.range]
+        let annotations = rangesToSave.compactMap { range -> Bookmark? in
+            let validRange = NSIntersectionRange(
+                range,
+                NSRange(location: 0, length: content.length)
+            )
+            guard validRange.length > 0 else { return nil }
+            return Bookmark(
+                bookId: book.id,
+                chapterIndex: selection.chapterIndex,
+                location: validRange.location,
+                length: validRange.length,
+                type: type,
+                note: note,
+                selectedText: content.substring(with: validRange)
+            )
+        }
+        guard !annotations.isEmpty else { return }
+
+        isSavingSelection = true
+        let savePublishers = annotations.map { bookmarkRepository.addBookmark($0) }
+        Publishers.MergeMany(savePublishers)
+            .collect()
+            .receive(on: DispatchQueue.main)
+            .sink(
+                receiveCompletion: { [weak self] completion in
+                    guard let self else { return }
+                    self.isSavingSelection = false
+                    if case .failure(let error) = completion {
+                        self.showCommentComposer = false
+                        self.showSelectionActions = true
+                        self.presentOperationError(title: "批注保存失败", error: error)
+                        self.loadBookmarks()
+                    }
+                },
+                receiveValue: { [weak self] savedAnnotations in
+                    guard let self else { return }
+                    self.currentBookmarks.append(contentsOf: savedAnnotations)
+                    self.refreshBookmarkState()
+                    self.cancelSelection()
+                }
+            )
+            .store(in: &cancellables)
+    }
+
+    private func refreshBookmarkState() {
+        readerAnnotations = currentBookmarks.filter {
+            ($0.type == .highlight || $0.type == .note) && $0.length > 0
+        }
+        bookmarkList = currentBookmarks
+            .filter { $0.type == .bookmark }
+            .sorted { $0.createdAt > $1.createdAt }
+        if let key = presentedAnnotationKey, annotationGroup(for: key) == nil {
+            presentedAnnotationKey = nil
+        }
+    }
+
+    // MARK: - 划线详情与想法
+
+    var annotationGroups: [ReaderAnnotationGroup] {
+        ReaderAnnotationGroup.groups(from: currentBookmarks)
+    }
+
+    func annotationGroup(for key: ReaderAnnotationKey) -> ReaderAnnotationGroup? {
+        annotationGroups.first { $0.key == key }
+    }
+
+    @discardableResult
+    func openAnnotation(chapterIndex: Int, contentOffset: Int) -> Bool {
+        guard let group = annotationGroups
+            .filter({
+                $0.key.chapterIndex == chapterIndex
+                    && $0.key.contains(utf16Offset: contentOffset)
+            })
+            .sorted(by: {
+                if $0.key.length == $1.key.length {
+                    return $0.updatedAt > $1.updatedAt
+                }
+                return $0.key.length < $1.key.length
+            })
+            .first else {
+            return false
+        }
+
+        presentedAnnotationKey = group.key
+        showToolbar = false
+        return true
+    }
+
+    func closePresentedAnnotation() {
+        presentedAnnotationKey = nil
+    }
+
+    func addThought(to key: ReaderAnnotationKey, text: String) {
+        let note = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isSavingAnnotationThought,
+              !note.isEmpty,
+              let group = annotationGroup(for: key),
+              group.canAddThought else {
+            if annotationGroup(for: key)?.canAddThought == false {
+                bookmarkAlert = BookmarkAlert(
+                    title: "想法数量已达上限",
+                    message: "每段划线最多可以保存 \(ReaderAnnotationGroup.maximumThoughtCount) 条想法"
+                )
+            }
+            return
+        }
+
+        let thought = Bookmark(
+            bookId: key.bookId,
+            chapterIndex: key.chapterIndex,
+            location: key.location,
+            length: key.length,
+            type: .note,
+            note: note,
+            selectedText: sourceText(for: group)
+        )
+        isSavingAnnotationThought = true
+        bookmarkRepository.addBookmark(thought)
+            .receive(on: DispatchQueue.main)
+            .sink(
+                receiveCompletion: { [weak self] completion in
+                    guard let self else { return }
+                    self.isSavingAnnotationThought = false
+                    if case .failure(let error) = completion {
+                        self.presentOperationError(title: "想法保存失败", error: error)
+                    }
+                },
+                receiveValue: { [weak self] savedThought in
+                    self?.currentBookmarks.append(savedThought)
+                    self?.refreshBookmarkState()
+                }
+            )
+            .store(in: &cancellables)
+    }
+
+    func updateThought(_ thought: Bookmark, text: String) {
+        let note = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isSavingAnnotationThought,
+              !note.isEmpty,
+              thought.type == .note,
+              let index = currentBookmarks.firstIndex(where: { $0.id == thought.id }) else {
+            return
+        }
+
+        var updatedThought = currentBookmarks[index]
+        updatedThought.note = note
+        updatedThought.updatedAt = Date()
+        isSavingAnnotationThought = true
+        bookmarkRepository.updateBookmark(updatedThought)
+            .receive(on: DispatchQueue.main)
+            .sink(
+                receiveCompletion: { [weak self] completion in
+                    guard let self else { return }
+                    self.isSavingAnnotationThought = false
+                    if case .failure(let error) = completion {
+                        self.presentOperationError(title: "想法更新失败", error: error)
+                    }
+                },
+                receiveValue: { [weak self] savedThought in
+                    guard let self,
+                          let savedIndex = self.currentBookmarks.firstIndex(where: {
+                              $0.id == savedThought.id
+                          }) else {
+                        return
+                    }
+                    self.currentBookmarks[savedIndex] = savedThought
+                    self.refreshBookmarkState()
+                }
+            )
+            .store(in: &cancellables)
+    }
+
+    func deleteThought(_ thought: Bookmark) {
+        guard !isSavingAnnotationThought, thought.type == .note else { return }
+        isSavingAnnotationThought = true
+        bookmarkRepository.deleteBookmark(byId: thought.id)
+            .receive(on: DispatchQueue.main)
+            .sink(
+                receiveCompletion: { [weak self] completion in
+                    guard let self else { return }
+                    self.isSavingAnnotationThought = false
+                    if case .failure(let error) = completion {
+                        self.presentOperationError(title: "想法删除失败", error: error)
+                    }
+                },
+                receiveValue: { [weak self] _ in
+                    self?.currentBookmarks.removeAll { $0.id == thought.id }
+                    self?.refreshBookmarkState()
+                }
+            )
+            .store(in: &cancellables)
+    }
+
+    private func annotationGroup(containing selection: ReaderTextSelection) -> ReaderAnnotationGroup? {
+        annotationGroups
+            .filter {
+                $0.key.chapterIndex == selection.chapterIndex
+                    && $0.key.location <= selection.lowerBound
+                    && NSMaxRange($0.key.range) >= selection.upperBound
+            }
+            .min { $0.key.length < $1.key.length }
+    }
+
+    private func sourceText(for group: ReaderAnnotationGroup) -> String {
+        if !group.selectedText.isEmpty {
+            return group.selectedText
+        }
+        guard let chapter = chapters[safe: group.key.chapterIndex] else { return "" }
+        let content = chapter.content as NSString
+        let range = NSIntersectionRange(
+            group.key.range,
+            NSRange(location: 0, length: content.length)
+        )
+        return range.length > 0 ? content.substring(with: range) : ""
+    }
+
     /// 保存阅读进度
     private func saveProgress() {
         guard let page = currentPage else { return }
@@ -561,6 +1017,7 @@ class ReaderViewModel: ObservableObject {
                     },
                     receiveValue: { [weak self] savedBookmark in
                         self?.currentBookmarks.append(savedBookmark)
+                        self?.refreshBookmarkState()
                         self?.checkCurrentPageBookmark()
                         self?.bookmarkAlert = BookmarkAlert(
                             title: "书签已添加",
@@ -574,12 +1031,15 @@ class ReaderViewModel: ObservableObject {
 
     /// 打开书签列表
     func openBookmarkList() {
-        bookmarkList = currentBookmarks.sorted { $0.createdAt > $1.createdAt }
+        bookmarkList = currentBookmarks
+            .filter { $0.type == .bookmark }
+            .sorted { $0.createdAt > $1.createdAt }
         showBookmarkList = true
     }
 
     /// 跳转到书签所在章节
     func jumpToBookmark(_ bookmark: Bookmark) {
+        guard bookmark.type == .bookmark else { return }
         if let targetPage = pageContaining(
             chapterIndex: bookmark.chapterIndex,
             contentOffset: bookmark.location
@@ -595,6 +1055,7 @@ class ReaderViewModel: ObservableObject {
 
     /// 删除书签
     func deleteBookmark(_ bookmark: Bookmark) {
+        guard bookmark.type == .bookmark else { return }
         bookmarkRepository.deleteBookmark(byId: bookmark.id)
             .receive(on: DispatchQueue.main)
             .sink(
@@ -605,7 +1066,7 @@ class ReaderViewModel: ObservableObject {
                 },
                 receiveValue: { [weak self] _ in
                     self?.currentBookmarks.removeAll { $0.id == bookmark.id }
-                    self?.bookmarkList = self?.currentBookmarks.sorted { $0.createdAt > $1.createdAt } ?? []
+                    self?.refreshBookmarkState()
                     self?.checkCurrentPageBookmark()
                 }
             )
@@ -625,7 +1086,8 @@ class ReaderViewModel: ObservableObject {
             .contentOffset ?? Int.max
 
         return currentBookmarks.first {
-            $0.chapterIndex == page.chapterIndex
+            $0.type == .bookmark
+                && $0.chapterIndex == page.chapterIndex
                 && $0.location >= page.contentOffset
                 && $0.location < nextOffset
         }
