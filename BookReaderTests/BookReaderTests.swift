@@ -2,7 +2,10 @@ import Combine
 import CoreText
 import CoreData
 import Foundation
+import Network
+import PDFKit
 import Testing
+import UIKit
 @testable import BookReader
 
 struct BookReaderTests {
@@ -10,6 +13,239 @@ struct BookReaderTests {
         let viewModel = LibraryViewModel()
 
         #expect(viewModel.currentFilter == .all)
+    }
+
+    @Test func wifiTransferSessionGateRevokesStoppedSession() throws {
+        let gate = WiFiTransferSessionGate()
+        let firstToken = gate.activate()
+        let port = try #require(NWEndpoint.Port(rawValue: 12345))
+        let connection = NWConnection(
+            host: NWEndpoint.Host("127.0.0.1"),
+            port: port,
+            using: .tcp
+        )
+        defer { connection.cancel() }
+
+        #expect(gate.isAuthorized(firstToken))
+        #expect(gate.register(connection))
+        let stoppedConnections = gate.deactivate()
+        #expect(stoppedConnections.count == 1)
+        #expect(stoppedConnections.first === connection)
+        #expect(!gate.isAuthorized(firstToken))
+        #expect(!gate.register(connection))
+
+        let secondToken = gate.activate()
+        #expect(secondToken != firstToken)
+        #expect(gate.isAuthorized(secondToken))
+        #expect(!gate.isAuthorized(firstToken))
+        _ = gate.deactivate()
+    }
+
+    @Test func wifiTransferSessionGateCapsAndExpiresIdleConnections() throws {
+        let gate = WiFiTransferSessionGate(maximumConnections: 2)
+        let token = gate.activate()
+        let port = try #require(NWEndpoint.Port(rawValue: 12345))
+        let connections = (0..<3).map { _ in
+            NWConnection(host: NWEndpoint.Host("127.0.0.1"), port: port, using: .tcp)
+        }
+        defer { connections.forEach { $0.cancel() } }
+        let firstID = ObjectIdentifier(connections[0])
+        let secondID = ObjectIdentifier(connections[1])
+        let thirdID = ObjectIdentifier(connections[2])
+
+        #expect(gate.register(connections[0], at: 10))
+        #expect(gate.register(connections[1], at: 10))
+        #expect(!gate.register(connections[2], at: 10))
+        gate.markActivity(for: firstID, at: 25)
+        #expect(gate.beginProcessing(secondID))
+        #expect(gate.expireInactive(before: 20).isEmpty)
+
+        let expired = gate.expireInactive(before: 30)
+        #expect(expired.count == 1)
+        #expect(expired.first === connections[0])
+        #expect(!gate.isAuthorized(token, for: firstID))
+        #expect(gate.register(connections[2], at: 31))
+        #expect(gate.isAuthorized(token, for: thirdID))
+
+        let laterExpired = gate.expireInactive(before: 100)
+        #expect(laterExpired.count == 1)
+        #expect(laterExpired.first === connections[2])
+        let remaining = gate.deactivate()
+        #expect(remaining.count == 1)
+        #expect(remaining.first === connections[1])
+    }
+
+    @Test func wifiMultipartBoundaryPreservesMarkerLikeTextInsideFiles() throws {
+        let boundary = "BookReaderBoundary"
+        let firstPart = "Content-Disposition: form-data; name=\"files\"; filename=\"one.txt\"\r\n"
+            + "Content-Type: text/plain\r\n\r\n"
+            + "正文--\(boundary)仍是正文\r\n--\(boundary)X也不是分隔符"
+        let secondPart = "Content-Disposition: form-data; name=\"files\"; filename=\"two.txt\"\r\n\r\n第二本"
+        let body = Data(
+            "--\(boundary)\r\n\(firstPart)\r\n--\(boundary)\r\n\(secondPart)\r\n--\(boundary)--\r\n".utf8
+        )
+
+        let ranges = WiFiMultipartBoundary.partRanges(in: body, boundary: boundary)
+        #expect(ranges.count == 2)
+        let firstRange = try #require(ranges.first)
+        let lastRange = try #require(ranges.last)
+        #expect(String(decoding: body[firstRange], as: UTF8.self) == firstPart)
+        #expect(String(decoding: body[lastRange], as: UTF8.self) == secondPart)
+
+        let incompleteBody = Data("--\(boundary)\r\n\(firstPart)\r\n--\(boundary)X".utf8)
+        #expect(WiFiMultipartBoundary.partRanges(in: incompleteBody, boundary: boundary).isEmpty)
+    }
+
+    @Test func wifiTemporaryBodyCleanupOnlyRemovesOrphanedRequestFiles() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BookReaderWiFiCleanupTest-\(UUID().uuidString)", isDirectory: true)
+        let orphanedBody = directory.appendingPathComponent(UUID().uuidString)
+        let unrelatedFile = directory.appendingPathComponent("keep.txt")
+        let unrelatedDirectory = directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("unfinished".utf8).write(to: orphanedBody)
+        try Data("keep".utf8).write(to: unrelatedFile)
+        try FileManager.default.createDirectory(at: unrelatedDirectory, withIntermediateDirectories: true)
+
+        WiFiTemporaryBodyStore.cleanupOrphanedFiles(in: directory)
+
+        #expect(!FileManager.default.fileExists(atPath: orphanedBody.path))
+        #expect(FileManager.default.fileExists(atPath: unrelatedFile.path))
+        #expect(FileManager.default.fileExists(atPath: unrelatedDirectory.path))
+    }
+
+    @Test @MainActor func wifiTransferReceivesMultipartAndStopsItsHTTPServer() async throws {
+        let service = WiFiTransferService.shared
+        let recorder = WiFiReceivedFilesRecorder()
+        let observer = NotificationCenter.default.addObserver(
+            forName: .wifiTransferDidReceiveFiles,
+            object: service,
+            queue: nil
+        ) { notification in
+            recorder.capture(notification)
+        }
+        defer {
+            NotificationCenter.default.removeObserver(observer)
+            service.stop()
+            for fileURL in recorder.fileURLs {
+                try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent())
+            }
+        }
+
+        try #require(service.start())
+        for _ in 0..<200 where service.serverURL == nil {
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        let advertisedURL = try #require(service.serverURL)
+        var components = try #require(URLComponents(string: advertisedURL))
+        components.host = "127.0.0.1"
+        components.path = "/upload"
+        let uploadURL = try #require(components.url)
+        let boundary = "BookReaderHTTPBoundary"
+        let filename = "loopback-\(UUID().uuidString).txt"
+        let fileContent = "正文--\(boundary)\r\n--\(boundary)X仍是正文"
+        let bodyString = "--\(boundary)\r\nContent-Disposition: form-data; name=\"files\"; filename=\"\(filename)\"\r\n"
+            + "Content-Type: text/plain\r\n\r\n\(fileContent)\r\n--\(boundary)--\r\n"
+        let body = Data(bodyString.utf8)
+        var request = URLRequest(url: uploadURL)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.timeoutInterval = 10
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+
+        let (responseData, response) = try await URLSession.shared.data(for: request)
+        let httpResponse = try #require(response as? HTTPURLResponse)
+        #expect(httpResponse.statusCode == 200)
+        let result = try #require(JSONSerialization.jsonObject(with: responseData) as? [String: Any])
+        #expect(result["success"] as? Int == 1)
+        let receivedURL = try #require(recorder.fileURLs.first)
+        #expect(receivedURL.lastPathComponent == filename)
+        #expect(try String(contentsOf: receivedURL, encoding: .utf8) == fileContent)
+
+        let requestBodyDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BookReaderWiFiRequestBodies", isDirectory: true)
+        let existingBodies = Set(
+            (try? FileManager.default.contentsOfDirectory(
+                at: requestBodyDirectory,
+                includingPropertiesForKeys: nil
+            )) ?? []
+        )
+        let portNumber = try #require(components.port)
+        let port = try #require(NWEndpoint.Port(rawValue: UInt16(portNumber)))
+        let query = try #require(components.percentEncodedQuery)
+        let pendingConnection = NWConnection(
+            host: NWEndpoint.Host("127.0.0.1"),
+            port: port,
+            using: .tcp
+        )
+        let connectionProbe = WiFiConnectionProbe()
+        pendingConnection.stateUpdateHandler = { state in
+            if case .ready = state {
+                connectionProbe.markReady()
+            }
+            if case .failed = state {
+                connectionProbe.markClosed()
+            }
+        }
+        pendingConnection.start(queue: DispatchQueue(label: "com.bookreader.tests.partial-upload"))
+        defer { pendingConnection.cancel() }
+        for _ in 0..<100 where !connectionProbe.isReady {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        try #require(connectionProbe.isReady)
+
+        let partialBody = "--\(boundary)\r\nContent-Disposition: form-data; name=\"files\"; filename=\"unfinished.txt\"\r\n\r\n部分正文"
+        let partialRequest = "POST /upload?\(query) HTTP/1.1\r\n"
+            + "Host: 127.0.0.1\r\n"
+            + "Content-Type: multipart/form-data; boundary=\(boundary)\r\n"
+            + "Content-Length: \(partialBody.utf8.count + 10_000)\r\n\r\n"
+            + partialBody
+        pendingConnection.send(content: Data(partialRequest.utf8), completion: .contentProcessed { _ in })
+        pendingConnection.receive(minimumIncompleteLength: 1, maximumLength: 1_024) { _, _, isComplete, error in
+            if isComplete || error != nil {
+                connectionProbe.markClosed()
+            }
+        }
+        var pendingBodyURL: URL?
+        for _ in 0..<100 where pendingBodyURL == nil {
+            let currentBodies = (try? FileManager.default.contentsOfDirectory(
+                at: requestBodyDirectory,
+                includingPropertiesForKeys: nil
+            )) ?? []
+            pendingBodyURL = currentBodies.first(where: { !existingBodies.contains($0) })
+            if pendingBodyURL == nil {
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+        }
+        let unfinishedBodyURL = try #require(pendingBodyURL)
+        var writtenByteCount = 0
+        for _ in 0..<100 where writtenByteCount == 0 {
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: unfinishedBodyURL.path) {
+                writtenByteCount = attributes[.size] as? Int ?? 0
+            }
+            if writtenByteCount == 0 {
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+        }
+        #expect(writtenByteCount > 0)
+
+        service.stop()
+        for _ in 0..<100 where (FileManager.default.fileExists(atPath: unfinishedBodyURL.path)
+            || !connectionProbe.isClosed) {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        #expect(!FileManager.default.fileExists(atPath: unfinishedBodyURL.path))
+        #expect(connectionProbe.isClosed)
+        #expect(recorder.fileURLs == [receivedURL])
+        var stoppedRequest = URLRequest(url: uploadURL)
+        stoppedRequest.timeoutInterval = 2
+        do {
+            _ = try await URLSession.shared.data(for: stoppedRequest)
+            Issue.record("Stopped WiFi transfer server still accepted an HTTP request")
+        } catch {
+            // The listener and its accepted connections should already be closed.
+        }
     }
 
     @Test func txtParserUsesUTF16Offsets() throws {
@@ -45,11 +281,47 @@ struct BookReaderTests {
         )
 
         #expect(ranges == [
+            PDFParser.PageRange(startPage: 0, endPage: 0),
             PDFParser.PageRange(startPage: 1, endPage: 1),
             PDFParser.PageRange(startPage: 2, endPage: 3),
             PDFParser.PageRange(startPage: 4, endPage: 5)
         ])
+        #expect(PDFParser.normalizedPageRanges(pageIndices: [], pageCount: 6).isEmpty)
+        #expect(PDFParser.normalizedPageRanges(pageIndices: [0], pageCount: 2) == [
+            PDFParser.PageRange(startPage: 0, endPage: 1)
+        ])
         #expect(PDFParser.normalizedPageRanges(pageIndices: [0], pageCount: 0).isEmpty)
+    }
+
+    @Test func pdfOutlinePreservesPrefaceBeforeFirstDestination() throws {
+        let renderer = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 300, height: 400))
+        let pdfData = renderer.pdfData { context in
+            for text in ["Preface text", "Chapter text"] {
+                context.beginPage()
+                (text as NSString).draw(
+                    at: CGPoint(x: 20, y: 20),
+                    withAttributes: [.font: UIFont.systemFont(ofSize: 18)]
+                )
+            }
+        }
+        let document = try #require(PDFDocument(data: pdfData))
+        let chapterPage = try #require(document.page(at: 1))
+        let outlineRoot = PDFOutline()
+        let chapterOutline = PDFOutline()
+        chapterOutline.label = "第一章"
+        chapterOutline.destination = PDFDestination(page: chapterPage, at: .zero)
+        outlineRoot.insertChild(chapterOutline, at: 0)
+        document.outlineRoot = outlineRoot
+
+        let fileURL = temporaryFileURL(name: "preface-outline.pdf")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        #expect(document.write(to: fileURL))
+
+        let parsed = try PDFParser().parse(fileURL: fileURL)
+        let chapter = try #require(parsed.chapters.dropFirst().first)
+        #expect(parsed.chapters.map(\.title) == ["前言", "第一章"])
+        #expect(parsed.chapters.map(\.content) == ["Preface text", "Chapter text"])
+        #expect(chapter.startLocation == "Preface text".utf16.count)
     }
 
     @Test func epubParserReadsAStandardDeflatedArchive() throws {
@@ -84,6 +356,9 @@ struct BookReaderTests {
         let bookId = UUID()
         defer { PageCacheManager.shared.clearCache(for: bookId) }
         let descriptor = makeDescriptor(viewportWidth: 390)
+        let chapters = [
+            Chapter(index: 0, title: "第一章", content: "第一页", length: 3)
+        ]
         let pages = [
             Page(
                 globalIndex: 0,
@@ -98,15 +373,327 @@ struct BookReaderTests {
         PageCacheManager.shared.saveCache(pages: pages, for: bookId, descriptor: descriptor)
 
         let cached = try #require(
-            PageCacheManager.shared.loadCache(for: bookId, expectedDescriptor: descriptor)
+            PageCacheManager.shared.loadCache(
+                for: bookId,
+                expectedDescriptor: descriptor,
+                chapters: chapters
+            )
         )
         #expect(cached.map(\.content) == ["第一页"])
         #expect(
             PageCacheManager.shared.loadCache(
                 for: bookId,
-                expectedDescriptor: makeDescriptor(viewportWidth: 430)
+                expectedDescriptor: makeDescriptor(viewportWidth: 430),
+                chapters: chapters
             ) == nil
         )
+    }
+
+    @Test func pageCacheRejectsPagesOutsideReadingOrder() {
+        let bookId = UUID()
+        defer { PageCacheManager.shared.clearCache(for: bookId) }
+        let pages = [
+            Page(
+                globalIndex: 0,
+                content: "efg",
+                chapterIndex: 0,
+                chapterTitle: "正文",
+                isChapterStart: true,
+                contentOffset: 4
+            ),
+            Page(
+                globalIndex: 1,
+                content: "bcd",
+                chapterIndex: 0,
+                chapterTitle: "正文",
+                isChapterStart: false,
+                contentOffset: 1
+            )
+        ]
+
+        PageCacheManager.shared.saveCache(
+            pages: pages,
+            for: bookId,
+            descriptor: makeDescriptor(viewportWidth: 390)
+        )
+
+        #expect(PageCacheManager.shared.loadCache(
+            for: bookId,
+            expectedDescriptor: makeDescriptor(viewportWidth: 390),
+            chapters: [Chapter(index: 0, title: "正文", content: "abcdefghij")]
+        ) == nil)
+        #expect(!PageCacheManager.shared.hasCache(for: bookId))
+    }
+
+    @Test func pageCacheRestoresCompleteUTF16CoverageAcrossEmptyChapters() throws {
+        let bookId = UUID()
+        defer { PageCacheManager.shared.clearCache(for: bookId) }
+        let descriptor = makeDescriptor(viewportWidth: 390)
+        let chapters = [
+            Chapter(index: 0, title: "开篇", content: "甲😀乙"),
+            Chapter(index: 1, title: "空章", content: ""),
+            Chapter(index: 2, title: "结尾", content: "终")
+        ]
+        let pages = [
+            Page(globalIndex: 0, content: "甲😀", chapterIndex: 0, chapterTitle: "开篇", isChapterStart: true, contentOffset: 0),
+            Page(globalIndex: 1, content: "乙", chapterIndex: 0, chapterTitle: "开篇", isChapterStart: false, contentOffset: 3),
+            Page(globalIndex: 2, content: "终", chapterIndex: 2, chapterTitle: "结尾", isChapterStart: true, contentOffset: 0)
+        ]
+
+        PageCacheManager.shared.saveCache(pages: pages, for: bookId, descriptor: descriptor)
+        let cached = try #require(PageCacheManager.shared.loadCache(
+            for: bookId,
+            expectedDescriptor: descriptor,
+            chapters: chapters
+        ))
+
+        #expect(cached.map(\.content) == ["甲😀", "乙", "终"])
+        #expect(cached.map(\.contentOffset) == [0, 3, 0])
+    }
+
+    @Test func pageCacheRejectsIncompleteOrInconsistentCoverage() {
+        let descriptor = makeDescriptor(viewportWidth: 390)
+        let chapters = [
+            Chapter(index: 0, title: "一", content: "abcd"),
+            Chapter(index: 1, title: "二", content: "ef")
+        ]
+        func page(
+            _ globalIndex: Int,
+            _ content: String,
+            chapterIndex: Int,
+            offset: Int,
+            title: String? = nil,
+            isChapterStart: Bool
+        ) -> Page {
+            Page(
+                globalIndex: globalIndex,
+                content: content,
+                chapterIndex: chapterIndex,
+                chapterTitle: title ?? chapters[chapterIndex].title,
+                isChapterStart: isChapterStart,
+                contentOffset: offset
+            )
+        }
+        let invalidPageSets = [
+            [page(0, "ab", chapterIndex: 0, offset: 0, isChapterStart: true),
+             page(1, "ef", chapterIndex: 1, offset: 0, isChapterStart: true)],
+            [page(0, "abcd", chapterIndex: 0, offset: 0, isChapterStart: true)],
+            [page(0, "ab", chapterIndex: 0, offset: 0, isChapterStart: true),
+             page(1, "d", chapterIndex: 0, offset: 3, isChapterStart: false),
+             page(2, "ef", chapterIndex: 1, offset: 0, isChapterStart: true)],
+            [page(0, "abc", chapterIndex: 0, offset: 0, isChapterStart: true),
+             page(1, "cd", chapterIndex: 0, offset: 2, isChapterStart: false),
+             page(2, "ef", chapterIndex: 1, offset: 0, isChapterStart: true)],
+            [page(0, "abcd", chapterIndex: 0, offset: 0, title: "旧标题", isChapterStart: true),
+             page(1, "ef", chapterIndex: 1, offset: 0, isChapterStart: true)],
+            [page(0, "abcd", chapterIndex: 0, offset: 0, isChapterStart: false),
+             page(1, "ef", chapterIndex: 1, offset: 0, isChapterStart: true)]
+        ]
+
+        for pages in invalidPageSets {
+            let bookId = UUID()
+            PageCacheManager.shared.saveCache(pages: pages, for: bookId, descriptor: descriptor)
+            #expect(PageCacheManager.shared.loadCache(
+                for: bookId,
+                expectedDescriptor: descriptor,
+                chapters: chapters
+            ) == nil)
+            #expect(!PageCacheManager.shared.hasCache(for: bookId))
+            PageCacheManager.shared.clearCache(for: bookId)
+        }
+    }
+
+    @Test func pageLocatorFindsChapterRangesAndUTF16Offsets() {
+        let pages = [
+            Page(globalIndex: 0, content: "甲", chapterIndex: 1, chapterTitle: "一", isChapterStart: true, contentOffset: 0),
+            Page(globalIndex: 1, content: "乙", chapterIndex: 1, chapterTitle: "一", isChapterStart: false, contentOffset: 10),
+            Page(globalIndex: 2, content: "丙", chapterIndex: 3, chapterTitle: "三", isChapterStart: true, contentOffset: 0)
+        ]
+
+        #expect(ReaderPageLocator.chapterRange(1, in: pages) == 0..<2)
+        #expect(ReaderPageLocator.chapterRange(2, in: pages) == nil)
+        #expect(ReaderPageLocator.chapterRange(3, in: pages) == 2..<3)
+        #expect(ReaderPageLocator.pageIndex(containing: -1, inChapter: 1, pages: pages) == 0)
+        #expect(ReaderPageLocator.pageIndex(containing: 9, inChapter: 1, pages: pages) == 0)
+        #expect(ReaderPageLocator.pageIndex(containing: 10, inChapter: 1, pages: pages) == 1)
+        #expect(ReaderPageLocator.pageIndex(containing: Int.max, inChapter: 1, pages: pages) == 1)
+        #expect(ReaderPageLocator.nextContentOffset(after: 0, in: pages) == 10)
+        #expect(ReaderPageLocator.nextContentOffset(after: 1, in: pages) == nil)
+    }
+
+    @Test func pageLocatorDoesNotConfuseOldGlobalIndexWithNewPage() {
+        let stalePage = Page(
+            globalIndex: 0,
+            content: "丙",
+            chapterIndex: 2,
+            chapterTitle: "二",
+            isChapterStart: false,
+            contentOffset: 10
+        )
+        let pages = [
+            Page(globalIndex: 0, content: "甲", chapterIndex: 1, chapterTitle: "一", isChapterStart: true, contentOffset: 0),
+            Page(globalIndex: 1, content: "乙", chapterIndex: 2, chapterTitle: "二", isChapterStart: true, contentOffset: 0),
+            Page(globalIndex: 2, content: "丙", chapterIndex: 2, chapterTitle: "二", isChapterStart: false, contentOffset: 10)
+        ]
+
+        #expect(ReaderPageLocator.pageIndex(matching: stalePage, in: pages) == 2)
+        #expect(ReaderPageLocator.pageIndex(matching: pages[0], in: pages) == 0)
+        #expect(ReaderPageLocator.pageIndex(matching: Page(
+            globalIndex: 0,
+            content: "旧排版页面",
+            chapterIndex: 2,
+            chapterTitle: "二",
+            isChapterStart: false,
+            contentOffset: 10
+        ), in: pages) == nil)
+        #expect(ReaderPageLocator.pageIndex(matching: Page(
+            globalIndex: 0,
+            content: "缺失",
+            chapterIndex: 2,
+            chapterTitle: "二",
+            isChapterStart: false,
+            contentOffset: 5
+        ), in: pages) == nil)
+    }
+
+    @Test @MainActor func bookmarkJumpLoadsAnUnpaginatedChapter() async throws {
+        let book = Book(
+            title: "章节跳转",
+            filePath: "/tmp/BookReaderTests-\(UUID().uuidString)-missing.txt",
+            format: .txt
+        )
+        defer { PageCacheManager.shared.clearCache(for: book.id) }
+        let viewModel = ReaderViewModel(
+            book: book,
+            bookRepository: RecordingBookRepository()
+        )
+        viewModel.setAvailableViewSize(CGSize(width: 120, height: 160))
+        viewModel.chapters = [
+            Chapter(index: 0, title: "一", content: "首页"),
+            Chapter(index: 1, title: "二", content: "中间章节"),
+            Chapter(index: 2, title: "三", content: String(repeating: "正文", count: 300))
+        ]
+        viewModel.pages = [
+            Page(
+                globalIndex: 0,
+                content: "首页",
+                chapterIndex: 0,
+                chapterTitle: "一",
+                isChapterStart: true,
+                contentOffset: 0
+            )
+        ]
+
+        let targetOffset = 250
+        viewModel.jumpToBookmark(Bookmark(
+            bookId: book.id,
+            chapterIndex: 2,
+            location: targetOffset
+        ))
+        for _ in 0..<300 where viewModel.isPreparingRemainingPages {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        let page = try #require(viewModel.currentPage)
+        #expect(page.chapterIndex == 2)
+        #expect(page.contentOffset <= targetOffset)
+        #expect(
+            (ReaderPageLocator.nextContentOffset(
+                after: viewModel.currentPageIndex,
+                in: viewModel.pages
+            ) ?? Int.max) > targetOffset
+        )
+        #expect(!viewModel.isPreparingRemainingPages)
+        for _ in 0..<200 where !PageCacheManager.shared.hasCache(for: book.id) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(PageCacheManager.shared.hasCache(for: book.id))
+    }
+
+    @Test func cancelledPaginationStopsBeforeProducingPages() {
+        let token = PaginationCancellationToken()
+        token.cancel()
+        let chapter = Chapter(index: 0, title: "正文", content: String(repeating: "长", count: 10_000))
+
+        let pages = ReaderPaginationService().paginate(
+            chapters: [chapter],
+            descriptor: makeDescriptor(viewportWidth: 120, viewportHeight: 160),
+            cancellationToken: token
+        )
+
+        #expect(pages.isEmpty)
+    }
+
+    @Test func paginationPlanPrioritizesFocusedAndAdjacentChapters() {
+        #expect(
+            ReaderPaginationPlan.priorityOrder(
+                chapterCount: 5,
+                focusedChapterIndex: 2
+            ) == [2, 1, 3, 0, 4]
+        )
+        #expect(
+            ReaderPaginationPlan.focusedAndAdjacentIndexes(
+                chapterCount: 5,
+                focusedChapterIndex: 2
+            ) == [1, 2, 3]
+        )
+        #expect(
+            ReaderPaginationPlan.focusedAndAdjacentIndexes(
+                chapterCount: 5,
+                focusedChapterIndex: 0
+            ) == [0, 1]
+        )
+    }
+
+    @Test func paginationPlanRestoresReadingOrderWhenMergingStages() {
+        let pagesByChapter = [
+            2: [Page(
+                globalIndex: 0,
+                content: "第三章",
+                chapterIndex: 2,
+                chapterTitle: "第三章",
+                isChapterStart: true,
+                contentOffset: 0
+            )],
+            1: [Page(
+                globalIndex: 0,
+                content: "第二章",
+                chapterIndex: 1,
+                chapterTitle: "第二章",
+                isChapterStart: true,
+                contentOffset: 0
+            )]
+        ]
+
+        let merged = ReaderPaginationPlan.mergedPages(
+            chapterIndexes: [2, 1],
+            pagesByChapter: pagesByChapter
+        )
+
+        #expect(merged.map(\.chapterIndex) == [1, 2])
+        #expect(merged.map(\.globalIndex) == [0, 1])
+        #expect(merged.map(\.content).joined() == "第二章第三章")
+    }
+
+    @Test func singleChapterPaginationKeepsItsLogicalChapterIndex() {
+        let content = String(repeating: "正文", count: 200)
+        let chapter = Chapter(
+            index: 7,
+            title: "第八章",
+            content: content,
+            length: content.utf16.count
+        )
+
+        let pages = ReaderPaginationService().paginateChapter(
+            chapter,
+            chapterIndex: 7,
+            descriptor: makeDescriptor(viewportWidth: 160, viewportHeight: 240)
+        )
+
+        #expect(!pages.isEmpty)
+        #expect(pages.allSatisfy { $0.chapterIndex == 7 })
+        #expect(pages.map(\.globalIndex) == Array(pages.indices))
+        #expect(pages.map(\.content).joined() == content)
     }
 
     @Test func paginationDoesNotTruncateBooksOverFiveHundredPages() {
@@ -498,7 +1085,7 @@ struct BookReaderTests {
         )
         let currentModel = try #require(
             NSManagedObjectModel(
-                contentsOf: modelDirectoryURL.appendingPathComponent("BookReaderV2.mom")
+                contentsOf: modelDirectoryURL.appendingPathComponent("BookReaderV3.mom")
             )
         )
         let storeDirectory = FileManager.default.temporaryDirectory
@@ -674,6 +1261,81 @@ struct BookReaderTests {
         #expect(viewModel.books.count == 2)
     }
 
+    @Test @MainActor func batchImportRetriesSameNameAfterFailureAndCountsAllSelections() async throws {
+        let repository = RecordingBookRepository()
+        let viewModel = LibraryViewModel(bookRepository: repository)
+        let sourceRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BookReaderBatchRetry-\(UUID().uuidString)", isDirectory: true)
+        let filename = "retry-\(UUID().uuidString).txt"
+        let missingURL = sourceRoot.appendingPathComponent("missing/").appendingPathComponent(filename)
+        let validURL = sourceRoot.appendingPathComponent("valid/").appendingPathComponent(filename)
+        let unsupportedURL = sourceRoot.appendingPathComponent("unsupported.bin")
+        let booksDirectory = try #require(
+            FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        ).appendingPathComponent("Books", isDirectory: true)
+        let destinationURL = booksDirectory.appendingPathComponent(filename)
+        defer {
+            try? FileManager.default.removeItem(at: sourceRoot)
+            try? FileManager.default.removeItem(at: destinationURL)
+        }
+        try FileManager.default.createDirectory(
+            at: validURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try "第一章\n有效的第二份".write(to: validURL, atomically: true, encoding: .utf8)
+
+        viewModel.importBooks(from: [missingURL, validURL, unsupportedURL])
+        for _ in 0..<300 where viewModel.isBatchImporting {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        #expect(!viewModel.isBatchImporting)
+        #expect(viewModel.batchImportTotal == 3)
+        #expect(viewModel.batchImportCurrent == 3)
+        #expect(viewModel.batchImportSuccessCount == 1)
+        #expect(viewModel.batchImportFailCount == 2)
+        #expect(repository.atomicAddBookCallCount == 1)
+        #expect(viewModel.books.first?.filePath == destinationURL.path)
+    }
+
+    @Test @MainActor func batchImportSkipsSameNameAfterSuccessfulImport() async throws {
+        let repository = RecordingBookRepository()
+        let viewModel = LibraryViewModel(bookRepository: repository)
+        let sourceRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BookReaderBatchDuplicate-\(UUID().uuidString)", isDirectory: true)
+        let filename = "duplicate-\(UUID().uuidString).txt"
+        let firstURL = sourceRoot.appendingPathComponent("first/").appendingPathComponent(filename)
+        let secondURL = sourceRoot.appendingPathComponent("second/").appendingPathComponent(filename)
+        let booksDirectory = try #require(
+            FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        ).appendingPathComponent("Books", isDirectory: true)
+        let destinationURL = booksDirectory.appendingPathComponent(filename)
+        defer {
+            try? FileManager.default.removeItem(at: sourceRoot)
+            try? FileManager.default.removeItem(at: destinationURL)
+        }
+        for url in [firstURL, secondURL] {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try "第一章\n正文".write(to: url, atomically: true, encoding: .utf8)
+        }
+
+        viewModel.importBooks(from: [firstURL, secondURL])
+        for _ in 0..<300 where viewModel.isBatchImporting {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        #expect(!viewModel.isBatchImporting)
+        #expect(viewModel.batchImportTotal == 2)
+        #expect(viewModel.batchImportCurrent == 2)
+        #expect(viewModel.batchImportSuccessCount == 1)
+        #expect(viewModel.batchImportFailCount == 1)
+        #expect(repository.atomicAddBookCallCount == 1)
+        #expect(viewModel.books.count == 1)
+    }
+
     @Test @MainActor func aSecondBatchWaitsForTheActiveImportInsteadOfBeingDropped() async throws {
         let repository = RecordingBookRepository()
         repository.shouldDelayNextAtomicImport = true
@@ -752,9 +1414,33 @@ struct BookReaderTests {
         ]
 
         viewModel.jumpToProgress(0.5)
+        viewModel.flushProgress()
 
         #expect(viewModel.readingProgress == 1)
         #expect(viewModel.readingProgress.isFinite)
+        #expect(repository.savedCompletionValues == [true])
+    }
+
+    @Test @MainActor func immediateFlushAfterPageTurnSavesLatestLocation() {
+        let repository = RecordingBookRepository()
+        let book = Book(title: "翻页退出", filePath: "/tmp/page-turn.txt", format: .txt)
+        let viewModel = ReaderViewModel(book: book, bookRepository: repository)
+        viewModel.chapters = [
+            Chapter(index: 0, title: "一", content: "开篇"),
+            Chapter(index: 1, title: "二", content: "甲乙丙丁戊己")
+        ]
+        viewModel.pages = [
+            Page(globalIndex: 0, content: "开篇", chapterIndex: 0, chapterTitle: "一", isChapterStart: true, contentOffset: 0),
+            Page(globalIndex: 1, content: "甲乙丙丁戊", chapterIndex: 1, chapterTitle: "二", isChapterStart: true, contentOffset: 0),
+            Page(globalIndex: 2, content: "己", chapterIndex: 1, chapterTitle: "二", isChapterStart: false, contentOffset: 5)
+        ]
+
+        viewModel.updateProgressForPage(2)
+        viewModel.flushProgress()
+
+        #expect(repository.savedProgressLocations.count == 1)
+        #expect(repository.savedProgressLocations.first?.chapterIndex == 1)
+        #expect(repository.savedProgressLocations.first?.contentOffset == 5)
         #expect(repository.savedCompletionValues == [true])
     }
 
@@ -814,6 +1500,56 @@ struct BookReaderTests {
     }
 }
 
+private final class WiFiReceivedFilesRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var urls: [URL] = []
+
+    var fileURLs: [URL] {
+        lock.lock()
+        defer { lock.unlock() }
+        return urls
+    }
+
+    func capture(_ notification: Notification) {
+        guard let fileURLs = notification.userInfo?[WiFiTransferNotificationKey.fileURLs] as? [URL] else {
+            return
+        }
+        lock.lock()
+        urls.append(contentsOf: fileURLs)
+        lock.unlock()
+    }
+}
+
+private final class WiFiConnectionProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var ready = false
+    private var closed = false
+
+    var isReady: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return ready
+    }
+
+    var isClosed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return closed
+    }
+
+    func markReady() {
+        lock.lock()
+        ready = true
+        lock.unlock()
+    }
+
+    func markClosed() {
+        lock.lock()
+        closed = true
+        lock.unlock()
+    }
+}
+
 private struct StubBookParser: BookChapterParsing {
     let chapters: [Chapter]
 
@@ -824,6 +1560,7 @@ private struct StubBookParser: BookChapterParsing {
 
 private final class RecordingBookRepository: BookRepositoryProtocol {
     var savedCompletionValues: [Bool] = []
+    var savedProgressLocations: [(chapterIndex: Int, contentOffset: Int)] = []
     var shouldFinishAtomicImportWithoutValue = false
     var shouldDelayNextAtomicImport = false
     private(set) var plainAddBookCallCount = 0
@@ -891,6 +1628,7 @@ private final class RecordingBookRepository: BookRepositoryProtocol {
         isCompleted: Bool
     ) -> AnyPublisher<Void, Error> {
         savedCompletionValues.append(isCompleted)
+        savedProgressLocations.append((chapterIndex, contentOffset))
         return success(())
     }
 

@@ -114,17 +114,24 @@ class PDFParser {
     }
 
     /// 将 PDF 大纲中的页码整理为递增、不重叠且位于文档范围内的章节区间。
+    /// 第一个目录目标页之前的正文也必须保留，作为前言区间。
     /// PDF 目录允许嵌套、重复目标页，第三方文件也可能写入越界目标页。
     static func normalizedPageRanges(pageIndices: [Int], pageCount: Int) -> [PageRange] {
         guard pageCount > 0 else { return [] }
 
         let validStartPages = Array(Set(pageIndices.filter { (0..<pageCount).contains($0) })).sorted()
-        return validStartPages.enumerated().map { index, startPage in
+        guard let firstStartPage = validStartPages.first else { return [] }
+        var ranges: [PageRange] = []
+        if firstStartPage > 0 {
+            ranges.append(PageRange(startPage: 0, endPage: firstStartPage - 1))
+        }
+        ranges.append(contentsOf: validStartPages.enumerated().map { index, startPage in
             let endPage = index + 1 < validStartPages.count
                 ? validStartPages[index + 1] - 1
                 : pageCount - 1
             return PageRange(startPage: startPage, endPage: endPage)
-        }
+        })
+        return ranges
     }
     
     /// 解析 PDF 大纲（目录树）
@@ -178,7 +185,6 @@ class PDFParser {
         )
 
         for range in ranges {
-            guard let node = nodeByPage[range.startPage] else { continue }
             let content = extractText(
                 from: document,
                 startPage: range.startPage,
@@ -190,7 +196,7 @@ class PDFParser {
             
             chapters.append(ParsedChapter(
                 index: chapters.count,
-                title: node.title,
+                title: nodeByPage[range.startPage]?.title ?? "前言",
                 content: trimmedContent,
                 startLocation: 0,
                 length: trimmedContent.utf16.count

@@ -44,6 +44,7 @@ struct ReaderView: View {
             }
         }
         .onDisappear {
+            viewModel.flushProgress()
             ReadingTimeTracker.shared.stopReading()
             viewModel.stopSpeech()
         }
@@ -247,6 +248,7 @@ struct ReaderView: View {
             if viewModel.error == nil {
                 ReaderBottomToolbar(
                     progress: viewModel.readingProgress,
+                    isPreparingRemainingPages: viewModel.isPreparingRemainingPages,
                     hasPreviousChapter: viewModel.hasPreviousChapter,
                     hasNextChapter: viewModel.hasNextChapter,
                     onPreviousChapter: { viewModel.previousChapter() },
@@ -431,7 +433,7 @@ struct PageContentView: View {
             // 底部页码 - 固定高度区域
             HStack {
                 Spacer()
-                Text("\(pageIndex + 1)/\(viewModel.totalPages)")
+                Text(pageNumberText)
                     .font(.caption)
                     .foregroundColor(theme.secondaryTextColor)
                     .padding(.trailing, 20)
@@ -440,6 +442,14 @@ struct PageContentView: View {
             .frame(height: ReaderLayoutMetrics.footerHeight, alignment: .bottom)
         }
         .background(theme.backgroundColor)
+    }
+
+    private var pageNumberText: String {
+        if viewModel.isPreparingRemainingPages {
+            let progress = viewModel.chapterPageProgress
+            return "本章 \(progress.current)/\(progress.total) · 全书排版中"
+        }
+        return "\(pageIndex + 1)/\(viewModel.totalPages)"
     }
 }
 
@@ -474,6 +484,7 @@ private final class CoreTextPageUIView: UIView {
     var attributedText = NSAttributedString() {
         didSet {
             guard !oldValue.isEqual(to: attributedText) else { return }
+            accessibilityLabel = attributedText.string
             invalidateTextLayout()
             setNeedsDisplay()
         }
@@ -498,6 +509,8 @@ private final class CoreTextPageUIView: UIView {
         isOpaque = false
         clipsToBounds = true
         contentMode = .redraw
+        isAccessibilityElement = true
+        accessibilityTraits = .staticText
     }
 
     required init?(coder: NSCoder) {
@@ -506,6 +519,8 @@ private final class CoreTextPageUIView: UIView {
         isOpaque = false
         clipsToBounds = true
         contentMode = .redraw
+        isAccessibilityElement = true
+        accessibilityTraits = .staticText
     }
 
     override func layoutSubviews() {
@@ -900,13 +915,13 @@ struct PageViewController: UIViewControllerRepresentable {
             context.coordinator.lastPagesVersion = viewModel.pagesVersion
         }
         
-        // 检查是否需要更新：currentPage 变化，pages 版本变化，或当前显示的页面不在新数组中
+        // 检查是否需要更新：索引可能在渐进式分页后指向另一章节，不能只比较全局页号。
         let needsUpdate = pagesVersionChanged || context.coordinator.currentIndex != currentPage || {
-            // 检查当前显示的页面是否与新数组中的页面对应
             if let currentVC = uiViewController.viewControllers?.first as? UIHostingController<PageContentView> {
-                let currentGlobalIndex = currentVC.rootView.page.globalIndex
-                let expectedGlobalIndex = viewModel.pages[currentPage].globalIndex
-                return currentGlobalIndex != expectedGlobalIndex
+                let displayedPage = currentVC.rootView.page
+                let expectedPage = viewModel.pages[currentPage]
+                return displayedPage.chapterIndex != expectedPage.chapterIndex
+                    || displayedPage.contentOffset != expectedPage.contentOffset
             }
             return false
         }()
@@ -1333,11 +1348,12 @@ struct PageViewController: UIViewControllerRepresentable {
         }
         
         func pageViewController(_ pageViewController: UIPageViewController, viewControllerBefore viewController: UIViewController) -> UIViewController? {
-            // 基于传入的 viewController 确定前一页
-            // 必须在 pages 数组中查找实际索引，不能依赖 globalIndex-1（因为 globalIndex 可能不连续）
+            // 旧页面对象可能仍在翻页控制器里；按章节及正文偏移在最新快照中定位。
             guard let hostingVC = viewController as? UIHostingController<PageContentView> else { return nil }
-            let currentGlobalIndex = hostingVC.rootView.page.globalIndex
-            guard let currentArrayIndex = parent.viewModel.pages.firstIndex(where: { $0.globalIndex == currentGlobalIndex }),
+            guard let currentArrayIndex = ReaderPageLocator.pageIndex(
+                matching: hostingVC.rootView.page,
+                in: parent.viewModel.pages
+            ),
                   currentArrayIndex > 0 else { return nil }
             let previousArrayIndex = currentArrayIndex - 1
             guard let page = parent.makePageView(at: previousArrayIndex) else { return nil }
@@ -1347,8 +1363,10 @@ struct PageViewController: UIViewControllerRepresentable {
         func pageViewController(_ pageViewController: UIPageViewController, viewControllerAfter viewController: UIViewController) -> UIViewController? {
             // 基于传入的 viewController 确定后一页
             guard let hostingVC = viewController as? UIHostingController<PageContentView> else { return nil }
-            let currentGlobalIndex = hostingVC.rootView.page.globalIndex
-            guard let currentArrayIndex = parent.viewModel.pages.firstIndex(where: { $0.globalIndex == currentGlobalIndex }),
+            guard let currentArrayIndex = ReaderPageLocator.pageIndex(
+                matching: hostingVC.rootView.page,
+                in: parent.viewModel.pages
+            ),
                   currentArrayIndex < parent.viewModel.pages.count - 1 else { return nil }
             let nextArrayIndex = currentArrayIndex + 1
             guard let page = parent.makePageView(at: nextArrayIndex) else { return nil }
@@ -1359,23 +1377,13 @@ struct PageViewController: UIViewControllerRepresentable {
             guard completed else { return }
             if let currentVC = pageViewController.viewControllers?.first {
                 if let hostingVC = currentVC as? UIHostingController<PageContentView> {
-                    let globalIndex = hostingVC.rootView.page.globalIndex
-                    if let newIndex = parent.viewModel.pages.firstIndex(where: { $0.globalIndex == globalIndex }) {
+                    if let newIndex = ReaderPageLocator.pageIndex(
+                        matching: hostingVC.rootView.page,
+                        in: parent.viewModel.pages
+                    ) {
                         currentIndex = newIndex
                         parent.currentPage = newIndex
                         parent.onPageChanged(newIndex)
-                    } else {
-                        // Fallback: 根据滑动方向推断
-                        if let previousVC = previousViewControllers.first as? UIHostingController<PageContentView> {
-                            let prevGlobalIndex = previousVC.rootView.page.globalIndex
-                            if globalIndex < prevGlobalIndex {
-                                currentIndex = max(0, currentIndex - 1)
-                            } else {
-                                currentIndex = min(parent.viewModel.pages.count - 1, currentIndex + 1)
-                            }
-                            parent.currentPage = currentIndex
-                            parent.onPageChanged(currentIndex)
-                        }
                     }
                 }
             }
@@ -1453,6 +1461,7 @@ private struct ReaderToolbarIconButton: View {
 
 struct ReaderBottomToolbar: View {
     let progress: Double
+    let isPreparingRemainingPages: Bool
     let hasPreviousChapter: Bool
     let hasNextChapter: Bool
     let onPreviousChapter: () -> Void
@@ -1484,9 +1493,10 @@ struct ReaderBottomToolbar: View {
                         in: 0...1
                     )
                     .tint(.accentColor)
+                    .disabled(isPreparingRemainingPages)
 
                     HStack {
-                        Text("阅读进度")
+                        Text(isPreparingRemainingPages ? "正在计算全书页数" : "阅读进度")
                         Spacer()
                         Text("\(Int((progress * 100).rounded()))%")
                             .monospacedDigit()

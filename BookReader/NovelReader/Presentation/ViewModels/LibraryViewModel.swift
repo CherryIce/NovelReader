@@ -229,7 +229,7 @@ class LibraryViewModel: ObservableObject {
                 receiveValue: { [weak self] existingBooks in
                     guard let self else { return }
 
-                    var seenFilenames = Set(existingBooks.map {
+                    let existingFilenames = Set(existingBooks.map {
                         URL(fileURLWithPath: $0.filePath).lastPathComponent.lowercased()
                     })
                     var urlsToImport: [URL] = []
@@ -238,7 +238,7 @@ class LibraryViewModel: ObservableObject {
                     for url in urls {
                         let filename = url.lastPathComponent
                         let key = filename.lowercased()
-                        guard self.isSupportedBookURL(url), seenFilenames.insert(key).inserted else {
+                        guard self.isSupportedBookURL(url), !existingFilenames.contains(key) else {
                             initialFailures.append("\(filename): 格式不支持或书籍已存在")
                             if removesSourceWhenFinished {
                                 self.cleanupSource(url)
@@ -257,8 +257,7 @@ class LibraryViewModel: ObservableObject {
                         return
                     }
 
-                    self.batchImportTotal = urlsToImport.count
-                    self.batchImportCurrent = 0
+                    self.batchImportCurrent = initialFailures.count
                     self.batchImportProgress = "准备导入 \(urlsToImport.count) 个文件..."
                     self.processBatchImport(
                         urls: urlsToImport,
@@ -266,6 +265,7 @@ class LibraryViewModel: ObservableObject {
                         successCount: 0,
                         failedTitles: initialFailures,
                         importedBooks: [],
+                        importedFilenames: [],
                         removesSourceWhenFinished: removesSourceWhenFinished
                     )
                 }
@@ -283,6 +283,7 @@ class LibraryViewModel: ObservableObject {
         successCount: Int,
         failedTitles: [String],
         importedBooks: [Book],
+        importedFilenames: Set<String>,
         removesSourceWhenFinished: Bool
     ) {
         guard index < urls.count else {
@@ -295,19 +296,39 @@ class LibraryViewModel: ObservableObject {
         }
 
         let url = urls[index]
-        batchImportCurrent = index + 1
-        batchImportProgress = "正在导入 (\(index + 1)/\(urls.count)): \(url.deletingPathExtension().lastPathComponent)"
+        let filenameKey = url.lastPathComponent.lowercased()
+        batchImportCurrent = batchImportTotal - urls.count + index + 1
+        batchImportProgress = "正在导入 (\(batchImportCurrent)/\(batchImportTotal)): \(url.deletingPathExtension().lastPathComponent)"
         importingBookTitle = url.deletingPathExtension().lastPathComponent
+
+        if importedFilenames.contains(filenameKey) {
+            cleanupSourceIfNeeded(url, enabled: removesSourceWhenFinished)
+            let nextFailedTitles = failedTitles + ["\(url.lastPathComponent): 同批次已导入"]
+            DispatchQueue.main.async { [weak self] in
+                self?.processBatchImport(
+                    urls: urls,
+                    index: index + 1,
+                    successCount: successCount,
+                    failedTitles: nextFailedTitles,
+                    importedBooks: importedBooks,
+                    importedFilenames: importedFilenames,
+                    removesSourceWhenFinished: removesSourceWhenFinished
+                )
+            }
+            return
+        }
 
         performImport(from: url, removesSourceWhenFinished: removesSourceWhenFinished) { [weak self] result in
             guard let self else { return }
             var nextSuccessCount = successCount
             var nextFailedTitles = failedTitles
             var nextImportedBooks = importedBooks
+            var nextImportedFilenames = importedFilenames
             switch result {
             case .success(let book):
                 nextSuccessCount += 1
                 nextImportedBooks.append(book)
+                nextImportedFilenames.insert(filenameKey)
             case .failure(let message):
                 nextFailedTitles.append(message)
             }
@@ -318,6 +339,7 @@ class LibraryViewModel: ObservableObject {
                 successCount: nextSuccessCount,
                 failedTitles: nextFailedTitles,
                 importedBooks: nextImportedBooks,
+                importedFilenames: nextImportedFilenames,
                 removesSourceWhenFinished: removesSourceWhenFinished
             )
         }
@@ -329,6 +351,7 @@ class LibraryViewModel: ObservableObject {
         importedBooks: [Book]
     ) {
         publishImportedBooks(importedBooks)
+        batchImportCurrent = batchImportTotal
         isBatchImporting = false
         batchImportProgress = ""
         importingBookTitle = ""

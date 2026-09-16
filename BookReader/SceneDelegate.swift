@@ -10,12 +10,7 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         
         let window = UIWindow(windowScene: windowScene)
         
-        // 使用 NovelReader 的 ContentView 作为根视图
-        let contentView = ContentView()
-            .environment(
-                \.managedObjectContext,
-                PersistenceController.shared.container.viewContext
-            )
+        let contentView = PersistenceRootView(controller: PersistenceController.shared)
         
         window.rootViewController = UIHostingController(rootView: contentView)
         self.window = window
@@ -51,3 +46,39 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
 }
 
+private struct PersistenceRootView: View {
+    @ObservedObject var controller: PersistenceController
+
+    var body: some View {
+        Group {
+            if controller.isStoreLoaded {
+                ContentView()
+                    .environment(\.managedObjectContext, controller.container.viewContext)
+            } else if let error = controller.storeLoadError {
+                VStack(spacing: 18) {
+                    Image(systemName: "externaldrive.badge.exclamationmark")
+                        .font(.system(size: 48))
+                        .foregroundColor(.orange)
+                    Text("书库暂时无法打开")
+                        .font(.title2.weight(.semibold))
+                    Text("原始书籍文件不会被自动删除。请重试；如果问题持续存在，请先保留应用文件共享目录中的备份。")
+                        .font(.body)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                    Button("重试") {
+                        controller.retryLoadingPersistentStore()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Text(error.localizedDescription)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .accessibilityLabel("存储错误详情：\(error.localizedDescription)")
+                }
+                .padding(28)
+            } else {
+                ProgressView("正在打开书库…")
+            }
+        }
+    }
+}

@@ -2,6 +2,181 @@ import Foundation
 import Combine
 import Network
 
+/// 统一管理传书会话令牌与已接入连接，供监听和接收队列安全访问。
+final class WiFiTransferSessionGate {
+    private struct ActiveConnection {
+        let connection: NWConnection
+        var lastActivity: TimeInterval
+        var isProcessing = false
+    }
+
+    private let lock = NSLock()
+    private let maximumConnections: Int
+    private var token = UUID().uuidString
+    private var isActive = false
+    private var connections: [ObjectIdentifier: ActiveConnection] = [:]
+
+    init(maximumConnections: Int = 8) {
+        self.maximumConnections = max(1, maximumConnections)
+    }
+
+    func activate() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        token = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        isActive = true
+        return token
+    }
+
+    func isAuthorized(_ candidate: String?, for connectionID: ObjectIdentifier? = nil) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isActive && candidate == token
+            && (connectionID.map { connections[$0] != nil } ?? true)
+    }
+
+    func register(
+        _ connection: NWConnection,
+        at time: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard isActive, connections.count < maximumConnections else { return false }
+        connections[ObjectIdentifier(connection)] = ActiveConnection(
+            connection: connection,
+            lastActivity: time
+        )
+        return true
+    }
+
+    func markActivity(
+        for connectionID: ObjectIdentifier,
+        at time: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) {
+        lock.lock()
+        if isActive {
+            connections[connectionID]?.lastActivity = time
+        }
+        lock.unlock()
+    }
+
+    func beginProcessing(_ connectionID: ObjectIdentifier) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard isActive, connections[connectionID] != nil else { return false }
+        connections[connectionID]?.isProcessing = true
+        return true
+    }
+
+    func isRegistered(_ connectionID: ObjectIdentifier) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isActive && connections[connectionID] != nil
+    }
+
+    func expireInactive(before cutoff: TimeInterval) -> [NWConnection] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard isActive else { return [] }
+        let expiredIDs = connections.compactMap { entry in
+            !entry.value.isProcessing && entry.value.lastActivity <= cutoff ? entry.key : nil
+        }
+        return expiredIDs.compactMap { connections.removeValue(forKey: $0)?.connection }
+    }
+
+    func remove(_ connectionID: ObjectIdentifier) {
+        lock.lock()
+        connections.removeValue(forKey: connectionID)
+        lock.unlock()
+    }
+
+    func deactivate() -> [NWConnection] {
+        lock.lock()
+        defer { lock.unlock() }
+        isActive = false
+        token = UUID().uuidString
+        let activeConnections = connections.values.map(\.connection)
+        connections.removeAll()
+        return activeConnections
+    }
+}
+
+/// 仅识别独立行上的 multipart 分隔符，避免书籍正文中的相似字节截断文件。
+enum WiFiMultipartBoundary {
+    static func partRanges(in data: Data, boundary: String) -> [Range<Data.Index>] {
+        let marker = Data("--\(boundary)".utf8)
+        let nextMarker = Data("\r\n--\(boundary)".utf8)
+        var openingSearchStart = data.startIndex
+        var firstPartStart: Data.Index?
+
+        while let opening = data.range(of: marker, in: openingSearchStart..<data.endIndex) {
+            let isLineStart = opening.lowerBound == data.startIndex
+                || (opening.lowerBound >= data.startIndex + 2
+                    && data[opening.lowerBound - 2] == 13
+                    && data[opening.lowerBound - 1] == 10)
+            let afterMarker = opening.upperBound
+            if isLineStart,
+               afterMarker + 2 <= data.endIndex,
+               data[afterMarker] == 13,
+               data[afterMarker + 1] == 10 {
+                firstPartStart = afterMarker + 2
+                break
+            }
+            openingSearchStart = opening.lowerBound + 1
+        }
+
+        guard var partStart = firstPartStart else { return [] }
+        var searchStart = partStart
+        var ranges: [Range<Data.Index>] = []
+
+        while let next = data.range(of: nextMarker, in: searchStart..<data.endIndex) {
+            let afterMarker = next.upperBound
+            if afterMarker + 2 <= data.endIndex,
+               data[afterMarker] == 13,
+               data[afterMarker + 1] == 10 {
+                ranges.append(partStart..<next.lowerBound)
+                partStart = afterMarker + 2
+                searchStart = partStart
+                continue
+            }
+            if afterMarker + 2 <= data.endIndex,
+               data[afterMarker] == 45,
+               data[afterMarker + 1] == 45,
+               (afterMarker + 2 == data.endIndex
+                   || (afterMarker + 4 <= data.endIndex
+                       && data[afterMarker + 2] == 13
+                       && data[afterMarker + 3] == 10)) {
+                ranges.append(partStart..<next.lowerBound)
+                return ranges
+            }
+            searchStart = next.lowerBound + 1
+        }
+        return []
+    }
+}
+
+/// 服务首次创建时清理上次异常退出遗留的请求体，不触碰其他临时文件。
+enum WiFiTemporaryBodyStore {
+    static let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("BookReaderWiFiRequestBodies", isDirectory: true)
+
+    static func cleanupOrphanedFiles(in directory: URL = WiFiTemporaryBodyStore.directory) {
+        let fileManager = FileManager.default
+        guard let contents = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey]
+        ) else {
+            return
+        }
+        for url in contents where UUID(uuidString: url.lastPathComponent) != nil {
+            guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+                continue
+            }
+            try? fileManager.removeItem(at: url)
+        }
+    }
+}
+
 /// WiFi 传书服务 - 在本地局域网启动 HTTP 服务器，允许用户通过浏览器上传书籍
 final class WiFiTransferService: NSObject, ObservableObject {
     static let shared = WiFiTransferService()
@@ -19,15 +194,59 @@ final class WiFiTransferService: NSObject, ObservableObject {
     private let maximumMultipartHeaderSize = 16 * 1024
     private let maximumUploadBodySize = 202 * 1024 * 1024
     private let maximumSingleFileSize = 200 * 1024 * 1024
-    private var sessionToken = UUID().uuidString
+    private let connectionIdleTimeout: TimeInterval = 30
+    private let connectionSweepInterval: TimeInterval = 5
+    private let sessionGate = WiFiTransferSessionGate()
+    private var connectionSweepTimer: DispatchSourceTimer?
 
     private final class RequestBuffer {
         var data = Data()
-        var hasReservedBodyCapacity = false
+    }
+
+    /// 将上传请求体直接写入临时文件，避免在堆内存中累积最多 202MB 的 Data。
+    private final class TemporaryRequestBody {
+        let url: URL
+        private var handle: FileHandle?
+        private(set) var count = 0
+
+        init() throws {
+            let directory = WiFiTemporaryBodyStore.directory
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            url = directory.appendingPathComponent(UUID().uuidString, isDirectory: false)
+            guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            handle = try FileHandle(forWritingTo: url)
+        }
+
+        func append(_ data: Data, expectedLength: Int) throws -> Bool {
+            guard count + data.count <= expectedLength else { return false }
+            guard let handle else { throw CocoaError(.fileNoSuchFile) }
+            try handle.write(contentsOf: data)
+            count += data.count
+            return true
+        }
+
+        func finish() throws {
+            try handle?.synchronize()
+            try handle?.close()
+            handle = nil
+        }
+
+        func cleanup() {
+            try? handle?.close()
+            handle = nil
+            try? FileManager.default.removeItem(at: url)
+        }
+
+        deinit {
+            cleanup()
+        }
     }
 
     private override init() {
         super.init()
+        WiFiTemporaryBodyStore.cleanupOrphanedFiles()
     }
 
     /// 获取本机 IP 地址
@@ -70,11 +289,24 @@ final class WiFiTransferService: NSObject, ObservableObject {
 
         do {
             let newListener = try NWListener(using: parameters, on: .any)
-            sessionToken = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+            let sessionToken = sessionGate.activate()
             uploadedCount = 0
             totalUploadCount = 0
             uploadLog = ["正在启动传书服务..."]
             listener = newListener
+
+            let sweepTimer = DispatchSource.makeTimerSource(queue: queue)
+            sweepTimer.schedule(
+                deadline: .now() + connectionSweepInterval,
+                repeating: connectionSweepInterval
+            )
+            sweepTimer.setEventHandler { [weak self] in
+                guard let self else { return }
+                let cutoff = ProcessInfo.processInfo.systemUptime - self.connectionIdleTimeout
+                self.sessionGate.expireInactive(before: cutoff).forEach { $0.cancel() }
+            }
+            connectionSweepTimer = sweepTimer
+            sweepTimer.resume()
 
             newListener.stateUpdateHandler = { [weak self, weak newListener] state in
                 guard let self else { return }
@@ -86,7 +318,7 @@ final class WiFiTransferService: NSObject, ObservableObject {
                         guard self.listener === newListener else { return }
                         self.isRunning = true
                         if let port, let ipAddress {
-                            self.serverURL = "http://\(ipAddress):\(port)/?token=\(self.sessionToken)"
+                            self.serverURL = "http://\(ipAddress):\(port)/?token=\(sessionToken)"
                             self.uploadLog = ["服务器已启动: \(self.serverURL ?? "")"]
                         } else {
                             self.serverURL = nil
@@ -96,9 +328,7 @@ final class WiFiTransferService: NSObject, ObservableObject {
                 case .failed(let error):
                     DispatchQueue.main.async {
                         guard self.listener === newListener else { return }
-                        self.listener = nil
-                        self.isRunning = false
-                        self.serverURL = nil
+                        self.stop()
                         self.uploadLog.append("服务器错误: \(error.localizedDescription)")
                     }
                 case .cancelled:
@@ -123,6 +353,19 @@ final class WiFiTransferService: NSObject, ObservableObject {
 
     /// 处理新连接
     private func handleConnection(_ connection: NWConnection) {
+        guard sessionGate.register(connection) else {
+            connection.cancel()
+            return
+        }
+        let connectionID = ObjectIdentifier(connection)
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed, .cancelled:
+                self?.sessionGate.remove(connectionID)
+            default:
+                break
+            }
+        }
         connection.start(queue: queue)
         receiveRequest(connection: connection, requestBuffer: RequestBuffer())
     }
@@ -133,6 +376,11 @@ final class WiFiTransferService: NSObject, ObservableObject {
             maximumLength: receiveChunkSize,
             completion: { [weak self] data, _, isComplete, error in
                 guard let self else { return }
+                let connectionID = ObjectIdentifier(connection)
+                guard self.sessionGate.isRegistered(connectionID) else {
+                    connection.cancel()
+                    return
+                }
 
                 if error != nil {
                     connection.cancel()
@@ -140,6 +388,7 @@ final class WiFiTransferService: NSObject, ObservableObject {
                 }
 
                 if let data {
+                    self.sessionGate.markActivity(for: connectionID)
                     requestBuffer.data.append(data)
                 }
 
@@ -171,7 +420,7 @@ final class WiFiTransferService: NSObject, ObservableObject {
                     return
                 }
                 let token = requestComponents.queryItems?.first(where: { $0.name == "token" })?.value
-                guard token == self.sessionToken else {
+                guard self.sessionGate.isAuthorized(token, for: connectionID) else {
                     self.sendResponse(connection: connection, statusCode: 401, body: "Unauthorized")
                     return
                 }
@@ -219,37 +468,111 @@ final class WiFiTransferService: NSObject, ObservableObject {
                     return
                 }
 
-                let expectedLength = headerRange.upperBound + contentLength
-                guard expectedLength <= self.maximumHeaderSize + self.maximumUploadBodySize else {
-                    self.sendResponse(connection: connection, statusCode: 413, body: "Upload Too Large")
+                let initialBody = Data(requestBuffer.data[headerRange.upperBound...])
+                guard contentLength > 0 else {
+                    guard initialBody.isEmpty else {
+                        self.sendResponse(connection: connection, statusCode: 400, body: "Unexpected Request Body")
+                        return
+                    }
+                    self.handleHTTPRequest(
+                        requestHead: requestHead,
+                        bodyFileURL: nil,
+                        connection: connection
+                    )
                     return
                 }
 
-                if !requestBuffer.hasReservedBodyCapacity {
-                    requestBuffer.data.reserveCapacity(expectedLength)
-                    requestBuffer.hasReservedBodyCapacity = true
-                }
+                do {
+                    let requestBody = try TemporaryRequestBody()
+                    guard try requestBody.append(initialBody, expectedLength: contentLength) else {
+                        self.sendResponse(connection: connection, statusCode: 400, body: "Request Body Too Large")
+                        return
+                    }
 
-                if requestBuffer.data.count < expectedLength {
-                    if isComplete {
+                    if requestBody.count == contentLength {
+                        try requestBody.finish()
+                        self.handleHTTPRequest(
+                            requestHead: requestHead,
+                            bodyFileURL: requestBody.url,
+                            connection: connection
+                        )
+                        requestBody.cleanup()
+                    } else if isComplete {
+                        requestBody.cleanup()
                         self.sendResponse(connection: connection, statusCode: 400, body: "Incomplete Request Body")
                     } else {
-                        self.receiveRequest(connection: connection, requestBuffer: requestBuffer)
+                        self.receiveRequestBody(
+                            connection: connection,
+                            requestHead: requestHead,
+                            requestBody: requestBody,
+                            expectedLength: contentLength
+                        )
                     }
+                } catch {
+                    self.sendResponse(connection: connection, statusCode: 500, body: "Unable To Store Upload")
+                }
+            }
+        )
+    }
+
+    private func receiveRequestBody(
+        connection: NWConnection,
+        requestHead: HTTPRequestHead,
+        requestBody: TemporaryRequestBody,
+        expectedLength: Int
+    ) {
+        connection.receive(
+            minimumIncompleteLength: 1,
+            maximumLength: receiveChunkSize
+        ) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+            let connectionID = ObjectIdentifier(connection)
+            guard self.sessionGate.isRegistered(connectionID) else {
+                requestBody.cleanup()
+                connection.cancel()
+                return
+            }
+            guard error == nil else {
+                requestBody.cleanup()
+                connection.cancel()
+                return
+            }
+
+            do {
+                if let data, !data.isEmpty {
+                    self.sessionGate.markActivity(for: connectionID)
+                }
+                if let data,
+                   try requestBody.append(data, expectedLength: expectedLength) == false {
+                    requestBody.cleanup()
+                    self.sendResponse(connection: connection, statusCode: 400, body: "Request Body Too Large")
                     return
                 }
 
-                if requestBuffer.data.count > expectedLength {
-                    requestBuffer.data.removeSubrange(expectedLength..<requestBuffer.data.endIndex)
+                if requestBody.count == expectedLength {
+                    try requestBody.finish()
+                    self.handleHTTPRequest(
+                        requestHead: requestHead,
+                        bodyFileURL: requestBody.url,
+                        connection: connection
+                    )
+                    requestBody.cleanup()
+                } else if isComplete {
+                    requestBody.cleanup()
+                    self.sendResponse(connection: connection, statusCode: 400, body: "Incomplete Request Body")
+                } else {
+                    self.receiveRequestBody(
+                        connection: connection,
+                        requestHead: requestHead,
+                        requestBody: requestBody,
+                        expectedLength: expectedLength
+                    )
                 }
-                requestBuffer.data.removeSubrange(requestBuffer.data.startIndex..<headerRange.upperBound)
-                self.handleHTTPRequest(
-                    requestHead: requestHead,
-                    body: requestBuffer.data,
-                    connection: connection
-                )
+            } catch {
+                requestBody.cleanup()
+                self.sendResponse(connection: connection, statusCode: 500, body: "Unable To Store Upload")
             }
-        )
+        }
     }
 
     private struct HTTPRequestHead {
@@ -279,14 +602,18 @@ final class WiFiTransferService: NSObject, ObservableObject {
         )
     }
 
-    private func handleHTTPRequest(requestHead: HTTPRequestHead, body: Data, connection: NWConnection) {
+    private func handleHTTPRequest(
+        requestHead: HTTPRequestHead,
+        bodyFileURL: URL?,
+        connection: NWConnection
+    ) {
         guard let components = URLComponents(string: "http://localhost\(requestHead.target)") else {
             sendResponse(connection: connection, statusCode: 400, body: "Bad Request")
             return
         }
 
         let token = components.queryItems?.first(where: { $0.name == "token" })?.value
-        guard token == sessionToken else {
+        guard let token, sessionGate.isAuthorized(token, for: ObjectIdentifier(connection)) else {
             sendResponse(connection: connection, statusCode: 401, body: "Unauthorized")
             return
         }
@@ -296,7 +623,20 @@ final class WiFiTransferService: NSObject, ObservableObject {
             serveUploadPage(connection: connection)
         case ("POST", "/upload"):
             let contentType = requestHead.headers["content-type"] ?? ""
-            processUpload(data: body, boundary: extractBoundary(from: contentType), connection: connection)
+            guard let bodyFileURL else {
+                sendResponse(connection: connection, statusCode: 400, body: "Missing Request Body")
+                return
+            }
+            guard sessionGate.beginProcessing(ObjectIdentifier(connection)) else {
+                connection.cancel()
+                return
+            }
+            processUpload(
+                bodyFileURL: bodyFileURL,
+                boundary: extractBoundary(from: contentType),
+                sessionToken: token,
+                connection: connection
+            )
         default:
             sendResponse(connection: connection, statusCode: 404, body: "Not Found")
         }
@@ -310,13 +650,23 @@ final class WiFiTransferService: NSObject, ObservableObject {
     }
 
     /// 处理上传的文件
-    private func processUpload(data: Data, boundary: String, connection: NWConnection) {
+    private func processUpload(
+        bodyFileURL: URL,
+        boundary: String,
+        sessionToken: String,
+        connection: NWConnection
+    ) {
         guard !boundary.isEmpty, boundary.utf8.count <= 200 else {
             sendResponse(connection: connection, statusCode: 400, body: "Invalid multipart")
             return
         }
 
-        let partRanges = multipartPartRanges(in: data, boundary: boundary)
+        guard let data = try? Data(contentsOf: bodyFileURL, options: .alwaysMapped) else {
+            sendResponse(connection: connection, statusCode: 400, body: "Unreadable multipart")
+            return
+        }
+
+        let partRanges = WiFiMultipartBoundary.partRanges(in: data, boundary: boundary)
         guard !partRanges.isEmpty else {
             sendResponse(connection: connection, statusCode: 400, body: "Invalid multipart")
             return
@@ -353,7 +703,11 @@ final class WiFiTransferService: NSObject, ObservableObject {
             let destinationURL = uploadDirectory.appendingPathComponent(filename, isDirectory: false)
             do {
                 try FileManager.default.createDirectory(at: uploadDirectory, withIntermediateDirectories: true)
-                try data[parsedPart.dataRange].write(to: destinationURL, options: .withoutOverwriting)
+                try copyFileRange(
+                    parsedPart.dataRange,
+                    from: bodyFileURL,
+                    to: destinationURL
+                )
                 uploadedFiles.append(filename)
                 uploadedURLs.append(destinationURL)
             } catch {
@@ -367,6 +721,11 @@ final class WiFiTransferService: NSObject, ObservableObject {
         }
 
         DispatchQueue.main.async {
+            guard self.sessionGate.isAuthorized(sessionToken, for: ObjectIdentifier(connection)) else {
+                try? FileManager.default.removeItem(at: uploadDirectory)
+                self.sendResponse(connection: connection, statusCode: 401, body: "Unauthorized")
+                return
+            }
             self.uploadedCount += uploadedFiles.count
             self.totalUploadCount += uploadedFiles.count + failedFiles.count
             for file in uploadedFiles {
@@ -383,46 +742,42 @@ final class WiFiTransferService: NSObject, ObservableObject {
                     userInfo: [WiFiTransferNotificationKey.fileURLs: uploadedURLs]
                 )
             }
-        }
-
-        sendJSONResponse(
-            connection: connection,
-            statusCode: 200,
-            object: [
+            self.sendJSONResponse(connection: connection, statusCode: 200, object: [
                 "success": uploadedFiles.count,
                 "failed": failedFiles.count,
                 "files": uploadedFiles,
                 "errors": failedFiles
-            ]
-        )
+            ])
+        }
     }
 
-    private func multipartPartRanges(in data: Data, boundary: String) -> [Range<Data.Index>] {
-        let marker = Data("--\(boundary)".utf8)
-        guard let firstBoundary = data.range(of: marker) else { return [] }
-
-        var partRanges: [Range<Data.Index>] = []
-        var partStart = firstBoundary.upperBound
-        while partStart < data.endIndex,
-              let nextBoundary = data.range(of: marker, in: partStart..<data.endIndex) {
-            var lowerBound = partStart
-            var upperBound = nextBoundary.lowerBound
-            if upperBound - lowerBound >= 2,
-               data[lowerBound] == 13,
-               data[data.index(after: lowerBound)] == 10 {
-                lowerBound += 2
-            }
-            if upperBound - lowerBound >= 2,
-               data[data.index(upperBound, offsetBy: -2)] == 13,
-               data[data.index(before: upperBound)] == 10 {
-                upperBound -= 2
-            }
-            if lowerBound < upperBound {
-                partRanges.append(lowerBound..<upperBound)
-            }
-            partStart = nextBoundary.upperBound
+    private func copyFileRange(
+        _ range: Range<Data.Index>,
+        from sourceURL: URL,
+        to destinationURL: URL
+    ) throws {
+        guard FileManager.default.createFile(atPath: destinationURL.path, contents: nil) else {
+            throw CocoaError(.fileWriteFileExists)
         }
-        return partRanges
+
+        let source = try FileHandle(forReadingFrom: sourceURL)
+        let destination = try FileHandle(forWritingTo: destinationURL)
+        defer {
+            try? source.close()
+            try? destination.close()
+        }
+
+        try source.seek(toOffset: UInt64(range.lowerBound))
+        var remaining = range.count
+        while remaining > 0 {
+            let chunkSize = min(receiveChunkSize, remaining)
+            guard let chunk = try source.read(upToCount: chunkSize), !chunk.isEmpty else {
+                throw CocoaError(.fileReadUnknown)
+            }
+            try destination.write(contentsOf: chunk)
+            remaining -= chunk.count
+        }
+        try destination.synchronize()
     }
 
     private func parseMultipartFile(
@@ -864,8 +1219,12 @@ final class WiFiTransferService: NSObject, ObservableObject {
 
     /// 停止服务器
     func stop() {
+        let activeConnections = sessionGate.deactivate()
+        connectionSweepTimer?.cancel()
+        connectionSweepTimer = nil
         listener?.cancel()
         listener = nil
+        activeConnections.forEach { $0.cancel() }
         isRunning = false
         serverURL = nil
         uploadedCount = 0

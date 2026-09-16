@@ -3,7 +3,7 @@ import Foundation
 /// 页面缓存数据（用于序列化）
 struct CachedPage: Codable {
     let globalIndex: Int
-    let content: String
+    let contentLength: Int
     let chapterIndex: Int
     let chapterTitle: String
     let isChapterStart: Bool
@@ -37,7 +37,7 @@ class PageCacheManager {
     static let shared = PageCacheManager()
     
     /// 缓存版本号 - 当分页算法变更时递增，使旧缓存自动失效
-    private let cacheVersion = 7
+    private let cacheVersion = 8
     
     private let fileManager = FileManager.default
     private let cacheDirectoryName = "PageCache"
@@ -46,7 +46,8 @@ class PageCacheManager {
     
     /// 获取缓存目录
     private var cacheDirectory: URL {
-        let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? fileManager.temporaryDirectory
         let cacheDir = caches.appendingPathComponent(cacheDirectoryName)
         
         if !fileManager.fileExists(atPath: cacheDir.path) {
@@ -71,7 +72,11 @@ class PageCacheManager {
     /// - Parameters:
     ///   - bookId: 书籍ID
     ///   - expectedDescriptor: 当前分页配置，任一输入变化都会使缓存失效
-    func loadCache(for bookId: UUID, expectedDescriptor: PageCacheDescriptor) -> [Page]? {
+    func loadCache(
+        for bookId: UUID,
+        expectedDescriptor: PageCacheDescriptor,
+        chapters: [Chapter]
+    ) -> [Page]? {
         let path = cacheFilePath(for: bookId)
         
         guard let data = try? Data(contentsOf: path) else {
@@ -91,16 +96,50 @@ class PageCacheManager {
                 try? fileManager.removeItem(at: path)
                 return nil
             }
-            return cachedData.pages.map { cached in
-                Page(
+            var pages: [Page] = []
+            pages.reserveCapacity(cachedData.pages.count)
+            let chapterContents = chapters.map { $0.content as NSString }
+            var nextContentOffsets = [Int](repeating: 0, count: chapters.count)
+            var previousPage: CachedPage?
+            for (expectedGlobalIndex, cached) in cachedData.pages.enumerated() {
+                let followsReadingOrder = previousPage.map { previous in
+                    cached.chapterIndex > previous.chapterIndex
+                        || (cached.chapterIndex == previous.chapterIndex
+                            && cached.contentOffset > previous.contentOffset)
+                } ?? true
+                guard cached.globalIndex == expectedGlobalIndex,
+                      followsReadingOrder,
+                      chapters.indices.contains(cached.chapterIndex) else {
+                    try? fileManager.removeItem(at: path)
+                    return nil
+                }
+                let chapterContent = chapterContents[cached.chapterIndex]
+                let range = NSRange(location: cached.contentOffset, length: cached.contentLength)
+                guard range.location == nextContentOffsets[cached.chapterIndex],
+                      range.location <= chapterContent.length,
+                      range.length > 0,
+                      range.length <= chapterContent.length - range.location,
+                      cached.chapterTitle == chapters[cached.chapterIndex].title,
+                      cached.isChapterStart == (range.location == 0) else {
+                    try? fileManager.removeItem(at: path)
+                    return nil
+                }
+                pages.append(Page(
                     globalIndex: cached.globalIndex,
-                    content: cached.content,
+                    content: chapterContent.substring(with: range),
                     chapterIndex: cached.chapterIndex,
                     chapterTitle: cached.chapterTitle,
                     isChapterStart: cached.isChapterStart,
                     contentOffset: cached.contentOffset
-                )
+                ))
+                nextContentOffsets[cached.chapterIndex] += range.length
+                previousPage = cached
             }
+            guard zip(nextContentOffsets, chapterContents).allSatisfy({ $0.0 == $0.1.length }) else {
+                try? fileManager.removeItem(at: path)
+                return nil
+            }
+            return pages
         }
         
         // 兼容旧版缓存格式（无版本号），直接失效
@@ -121,7 +160,7 @@ class PageCacheManager {
         let cachedPages = pages.map { page in
             CachedPage(
                 globalIndex: page.globalIndex,
-                content: page.content,
+                contentLength: (page.content as NSString).length,
                 chapterIndex: page.chapterIndex,
                 chapterTitle: page.chapterTitle,
                 isChapterStart: page.isChapterStart,

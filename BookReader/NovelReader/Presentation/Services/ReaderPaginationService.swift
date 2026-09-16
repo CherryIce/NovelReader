@@ -13,6 +13,139 @@ struct Page: Identifiable {
     let contentOffset: Int
 }
 
+/// 分阶段分页计划：先处理当前章节，再处理相邻章节，最后向两侧扩展。
+enum ReaderPaginationPlan {
+    static func priorityOrder(chapterCount: Int, focusedChapterIndex: Int) -> [Int] {
+        guard chapterCount > 0 else { return [] }
+        let focusedIndex = min(max(0, focusedChapterIndex), chapterCount - 1)
+        var result = [focusedIndex]
+
+        for distance in 1..<chapterCount {
+            let previousIndex = focusedIndex - distance
+            if previousIndex >= 0 {
+                result.append(previousIndex)
+            }
+
+            let nextIndex = focusedIndex + distance
+            if nextIndex < chapterCount {
+                result.append(nextIndex)
+            }
+        }
+
+        return result
+    }
+
+    static func focusedAndAdjacentIndexes(
+        chapterCount: Int,
+        focusedChapterIndex: Int
+    ) -> [Int] {
+        guard chapterCount > 0 else { return [] }
+        let focusedIndex = min(max(0, focusedChapterIndex), chapterCount - 1)
+        return [focusedIndex - 1, focusedIndex, focusedIndex + 1]
+            .filter { $0 >= 0 && $0 < chapterCount }
+    }
+
+    static func mergedPages(
+        chapterIndexes: [Int],
+        pagesByChapter: [Int: [Page]]
+    ) -> [Page] {
+        var merged: [Page] = []
+
+        for chapterIndex in chapterIndexes.sorted() {
+            guard let chapterPages = pagesByChapter[chapterIndex] else { continue }
+            for page in chapterPages {
+                merged.append(Page(
+                    globalIndex: merged.count,
+                    content: page.content,
+                    chapterIndex: page.chapterIndex,
+                    chapterTitle: page.chapterTitle,
+                    isChapterStart: page.isChapterStart,
+                    contentOffset: page.contentOffset
+                ))
+            }
+        }
+
+        return merged
+    }
+}
+
+/// 在按章节和正文偏移排序的页面数组中二分定位，避免长书翻页时扫描全部页面。
+enum ReaderPageLocator {
+    static func chapterRange(_ chapterIndex: Int, in pages: [Page]) -> Range<Int>? {
+        var lower = 0
+        var upper = pages.count
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if pages[middle].chapterIndex < chapterIndex {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        let first = lower
+        guard first < pages.count, pages[first].chapterIndex == chapterIndex else { return nil }
+
+        upper = pages.count
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if pages[middle].chapterIndex <= chapterIndex {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        return first..<lower
+    }
+
+    static func pageIndex(
+        containing contentOffset: Int,
+        inChapter chapterIndex: Int,
+        pages: [Page]
+    ) -> Int? {
+        guard let range = chapterRange(chapterIndex, in: pages) else { return nil }
+        var lower = range.lowerBound
+        var upper = range.upperBound
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if pages[middle].contentOffset <= contentOffset {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        return max(range.lowerBound, lower - 1)
+    }
+
+    static func pageIndex(matching page: Page, in pages: [Page]) -> Int? {
+        if pages.indices.contains(page.globalIndex) {
+            let candidate = pages[page.globalIndex]
+            if candidate.chapterIndex == page.chapterIndex,
+               candidate.contentOffset == page.contentOffset,
+               candidate.content == page.content {
+                return page.globalIndex
+            }
+        }
+
+        guard let index = pageIndex(
+            containing: page.contentOffset,
+            inChapter: page.chapterIndex,
+            pages: pages
+        ), pages[index].contentOffset == page.contentOffset,
+           pages[index].content == page.content else {
+            return nil
+        }
+        return index
+    }
+
+    static func nextContentOffset(after index: Int, in pages: [Page]) -> Int? {
+        guard pages.indices.contains(index), pages.indices.contains(index + 1),
+              pages[index + 1].chapterIndex == pages[index].chapterIndex else {
+            return nil
+        }
+        return pages[index + 1].contentOffset
+    }
+}
+
 /// 分页计算与页面视图共同使用的布局尺寸
 enum ReaderLayoutMetrics {
     static let horizontalPadding: CGFloat = 20
@@ -78,27 +211,97 @@ enum ReaderTextLayout {
     }
 }
 
-protocol ReaderPaginationServiceProtocol {
-    func paginate(chapters: [Chapter], descriptor: PageCacheDescriptor) -> [Page]
+protocol ReaderPaginationServiceProtocol: Sendable {
+    func paginate(
+        chapters: [Chapter],
+        descriptor: PageCacheDescriptor,
+        cancellationToken: PaginationCancellationToken?
+    ) -> [Page]
+
+    func paginateChapter(
+        _ chapter: Chapter,
+        chapterIndex: Int,
+        descriptor: PageCacheDescriptor,
+        cancellationToken: PaginationCancellationToken?
+    ) -> [Page]
+}
+
+extension ReaderPaginationServiceProtocol {
+    func paginate(chapters: [Chapter], descriptor: PageCacheDescriptor) -> [Page] {
+        paginate(chapters: chapters, descriptor: descriptor, cancellationToken: nil)
+    }
+
+    func paginateChapter(
+        _ chapter: Chapter,
+        chapterIndex: Int,
+        descriptor: PageCacheDescriptor
+    ) -> [Page] {
+        paginateChapter(
+            chapter,
+            chapterIndex: chapterIndex,
+            descriptor: descriptor,
+            cancellationToken: nil
+        )
+    }
+}
+
+/// 轻量、线程安全的分页取消标记。新的排版请求开始时，可让旧任务尽快停止消耗 CPU。
+final class PaginationCancellationToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
 }
 
 /// 纯分页服务：不读写 UI 状态、数据库或缓存，便于独立验证。
 final class ReaderPaginationService: ReaderPaginationServiceProtocol {
-    func paginate(chapters: [Chapter], descriptor: PageCacheDescriptor) -> [Page] {
+    func paginate(
+        chapters: [Chapter],
+        descriptor: PageCacheDescriptor,
+        cancellationToken: PaginationCancellationToken? = nil
+    ) -> [Page] {
         let textContainerSize = ReaderTextLayout.textContainerSize(for: descriptor)
         var pages: [Page] = []
 
         for (chapterIndex, chapter) in chapters.enumerated() {
+            guard cancellationToken?.isCancelled != true else { return [] }
             pages.append(contentsOf: paginateChapter(
                 chapter,
                 chapterIndex: chapterIndex,
                 descriptor: descriptor,
                 textContainerSize: textContainerSize,
-                startingGlobalIndex: pages.count
+                startingGlobalIndex: pages.count,
+                cancellationToken: cancellationToken
             ))
         }
 
         return pages
+    }
+
+    func paginateChapter(
+        _ chapter: Chapter,
+        chapterIndex: Int,
+        descriptor: PageCacheDescriptor,
+        cancellationToken: PaginationCancellationToken? = nil
+    ) -> [Page] {
+        paginateChapter(
+            chapter,
+            chapterIndex: chapterIndex,
+            descriptor: descriptor,
+            textContainerSize: ReaderTextLayout.textContainerSize(for: descriptor),
+            startingGlobalIndex: 0,
+            cancellationToken: cancellationToken
+        )
     }
 
     private func paginateChapter(
@@ -106,7 +309,8 @@ final class ReaderPaginationService: ReaderPaginationServiceProtocol {
         chapterIndex: Int,
         descriptor: PageCacheDescriptor,
         textContainerSize: CGSize,
-        startingGlobalIndex: Int
+        startingGlobalIndex: Int,
+        cancellationToken: PaginationCancellationToken?
     ) -> [Page] {
         guard !chapter.content.isEmpty else { return [] }
 
@@ -120,6 +324,7 @@ final class ReaderPaginationService: ReaderPaginationServiceProtocol {
         var currentOffset = 0
 
         while currentOffset < content.length {
+            guard cancellationToken?.isCancelled != true else { return [] }
             let remainingLength = content.length - currentOffset
             let frame = ReaderTextLayout.frame(
                 framesetter: framesetter,

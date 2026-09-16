@@ -7,7 +7,7 @@
 ### 已实现功能
 - ✅ **书架管理** - 网格展示、独立搜索页、筛选（全部/在读/已读完/收藏），支持收藏和完成状态切换
 - ✅ **TXT 解析** - 自动识别章节标题，支持 UTF-8/GBK/GB18030/Big5 编码自动检测
-- ✅ **EPUB/PDF 解析** - 支持 EPUB 内容解包和 PDF 文本、目录提取
+- ✅ **EPUB/PDF 解析** - 支持 EPUB 内容解包和 PDF 文本、目录提取；保留 PDF 首个目录章节之前的前言正文
 - ✅ **阅读器** - 基于 UIPageViewController 翻页、Core Text 分页引擎、进度拖动和阅读进度自动保存
 - ✅ **听书功能** - 支持系统语音朗读、暂停、语速和音调调节，并自动连续翻页
 - ✅ **目录导航** - 章节列表、当前章节高亮、快速跳转
@@ -16,15 +16,20 @@
 - ✅ **字体管理** - 系统字体（PingFang SC/Heiti SC/Songti SC/Kaiti SC）+ 自定义字体导入（ttf/otf）
 - ✅ **文件导入** - 支持 TXT/EPUB/PDF 单个或批量导入，以及局域网 WiFi 传书
 - ✅ **书签功能** - 同章多书签、精确位置跳转、书签列表和滑动删除
-- ✅ **分页缓存** - 缓存目录存储、原子写入，并按版本、文件时间、视图尺寸和排版设置完整校验
+- ✅ **划线与笔记** - 长按选择原文、跨页调整选区、添加划线/想法、笔记聚合与内容搜索
+- ✅ **分页缓存** - 只缓存页面范围元数据，后台读取并按版本、文件时间、视图尺寸和排版设置完整校验
+- ✅ **渐进式分页** - 无缓存时优先显示当前章节，随后预排相邻章节并在后台补齐全书
 - ✅ **导入进度** - 导入中实时显示进度和加载动画
+- ✅ **大文件传书保护** - WiFi 上传请求体流式写入临时文件，避免正文里的类分隔符截断文件；限制连接数并关闭空闲连接，停止时撤销令牌、取消在途连接，并清理异常退出遗留的请求体
 - ✅ **阅读统计** - 记录阅读时长、页数、连续阅读天数和分书统计
+- ✅ **数据迁移与恢复提示** - Core Data 自动迁移、常用查询索引和存储加载失败重试界面
+- ✅ **基础无障碍** - 阅读正文向 VoiceOver 暴露为静态文本，主要操作提供可访问标签
 - ✅ **iOS 15 基线** - 使用原生 fullScreenCover、ProgressView、UTType、dismiss 和 swipeActions
 
 ### 待实现功能
-- 📝 笔记/高亮功能（数据模型已就绪）
 - 📝 全文搜索
 - 📝 iCloud 同步
+- 📝 完整本地化与系统动态字体适配
 - 📝 翻页动画优化（仿真翻页等）
 
 ## 🏗️ 项目结构
@@ -40,7 +45,7 @@ BookReader/
     │   └── Services/
     │       ├── ThemeService.swift       # 主题服务（4种主题、字体大小、行间距、去抖动）
     │       ├── FontService.swift        # 字体服务（系统字体+自定义字体导入）
-    │       └── PageCacheManager.swift   # 分页缓存管理（JSON序列化、版本控制）
+    │       └── PageCacheManager.swift   # 分页范围缓存（后台读取、原子写入、版本控制）
     │
     ├── Domain/                          # 领域层（Clean Architecture）
     │   ├── Entities/
@@ -62,7 +67,7 @@ BookReader/
     │   │   └── BookmarkRepository.swift # 书签仓库实现
     │   ├── Local/
     │   │   └── CoreData/
-    │   │       ├── PersistenceController.swift        # Core Data 栈管理（单例、自动迁移）
+    │   │       ├── PersistenceController.swift        # Core Data 栈管理（自动迁移、失败重试）
     │   │       ├── BookEntity+Extension.swift         # BookEntity <-> Book 双向映射
     │   │       ├── ChapterEntity+Extension.swift      # ChapterEntity <-> Chapter 双向映射
     │   │       └── BookmarkEntity+Extension.swift     # BookmarkEntity <-> Bookmark 双向映射
@@ -73,7 +78,8 @@ BookReader/
     └── Presentation/                    # 表现层（MVVM）
         ├── ViewModels/
         │   ├── LibraryViewModel.swift   # 书架 ViewModel（加载/搜索/筛选/导入/删除）
-        │   └── ReaderViewModel.swift    # 阅读器 ViewModel（Core Text 分页/翻页/进度/书签）
+        │   ├── ReaderViewModel.swift    # 阅读器 ViewModel（分页协调/进度/书签/批注/听书）
+        │   └── NotesViewModel.swift     # 全局笔记与单书批注聚合
         └── Views/
             ├── ContentView.swift        # 根视图（首次引导门控 + 主 TabView）
             ├── OnboardingView.swift     # 三页首次使用引导
@@ -81,7 +87,10 @@ BookReader/
             │   └── LibraryView.swift    # 书架视图（搜索栏/筛选栏/书籍网格/导入/删除）
             ├── Reader/
             │   ├── ReaderView.swift     # 阅读器视图（PageViewController/工具栏/状态管理）
+            │   ├── ReaderAnnotationDetailView.swift # 批注详情与想法管理
             │   └── BookmarkListView.swift # 书签列表视图
+            ├── Notes/
+            │   └── NotesView.swift      # 笔记聚合、搜索和详情
             ├── Catalog/
             │   └── CatalogView.swift    # 章节目录视图
             └── Settings/
@@ -176,7 +185,17 @@ View → ViewModel → UseCase/Repository 协议 → Repository → Core Data
 - **依赖注入**: ViewModel 通过协议接收 Repository，便于单元测试和替换实现
 - **响应式数据流**: Repository 层全部使用 `AnyPublisher` 返回，ViewModel 通过 Combine 订阅
 - **Core Data 线程安全**: 所有 CoreData 操作在 `context.perform` 块中执行
-- **分页缓存**: `PageCacheManager` 将分页结果序列化为 JSON，完整校验视图尺寸、字体、字号、行距、布局和源文件时间
+- **分页缓存**: `PageCacheManager` 只持久化页面范围元数据，读取时从章节正文重建页面，避免在磁盘重复保存整本正文
+- **可取消排版**: 字体、尺寸连续变化时取消旧分页任务，旧结果不会覆盖最新页面
+- **分阶段排版**: 按当前章节、相邻章节、其余章节的顺序计算；阶段结果始终按原章节顺序重组，最终结果才写入完整缓存
+- **长书页面定位**: 翻页、章节进度和书签跳转按章节与 UTF-16 正文偏移二分查找；缓存乱序、缺页、重叠或章节内容不完整时自动失效并重新分页，避免漏字及阶段页号重排后跳错页
+- **合并进度保存**: 连续翻页使用 0.35 秒去抖；翻页时立即记录待保存位置，离开阅读器或进入后台时提交最后位置
+- **流式 WiFi 接收**: 上传请求体边接收边写临时文件，再按范围分块复制书籍，限制峰值堆内存
+- **异常退出清理**: 传书服务首次创建时，仅清理专用临时目录内由本服务命名的遗留请求体，避免占满设备存储
+- **连接资源上限**: 同时最多接入 8 个连接；每 5 秒检查一次，超过 30 秒无接收活动的连接会被关闭，已完整接收并正在处理的上传不计入空闲超时
+- **multipart 边界校验**: 仅将独立行上带合法后缀的边界识别为文件分隔符，拒绝缺失结束边界的请求
+- **停止传书**: 立即使当前会话令牌失效并取消已接入连接，清理未完成的上传请求体；停止后的上传结果不会再交付导入
+- **批量导入判重**: 以已存在书籍和本批次成功导入的文件名判重；前一份同名文件失败时仍尝试后一份，进度总数包含所有选中文件
 - **编码检测**: TXTParser 优先识别 BOM，再对整文件依次尝试 UTF-8、GB18030 和 Big5，避免仅抽样文件头造成误判
 - **去抖动优化**: 字体大小和行间距设置带 0.15 秒去抖动，避免频繁触发 Core Text 重分页
 
@@ -190,7 +209,7 @@ xcodebuild test \
   -only-testing:BookReaderTests
 ```
 
-当前单元测试覆盖默认书架筛选、TXT 编码回退与 UTF-16 偏移、分页缓存失效、超过 500 页的完整分页、单页进度，以及完成状态持久化；UI 测试包含主导航冒烟验证。
+当前 45 个单元测试覆盖默认书架筛选、TXT 编码回退与 UTF-16 偏移、EPUB/PDF 解析及目录前言保留、分页缓存失效与重建、乱序及正文覆盖不完整的缓存拒绝、分页取消、渐进式分页顺序、页面偏移定位、未预排章节的书签跳转、单章分页入口、超过 500 页的完整分页、划线批注、导入原子性、批量同名失败重试与进度计数、WiFi 会话停止后的令牌失效、连接上限与空闲回收、multipart 边界校验、本机 HTTP 上传/中途停止与清理、异常退出遗留请求体清理回归、数据迁移、阅读统计、翻页后立即退出时的进度保存、单页进度及完成状态持久化；UI 测试包含主导航冒烟验证。
 
 ## 📁 文件清单
 

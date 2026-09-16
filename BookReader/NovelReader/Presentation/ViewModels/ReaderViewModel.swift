@@ -11,6 +11,7 @@ struct BookmarkAlert: Identifiable {
 }
 
 /// 阅读器视图模型
+@MainActor
 class ReaderViewModel: ObservableObject {
     let book: Book
 
@@ -23,6 +24,7 @@ class ReaderViewModel: ObservableObject {
     @Published var showCatalog: Bool = false
     @Published var showSettings: Bool = false
     @Published var isLoading: Bool = false
+    @Published private(set) var isPreparingRemainingPages: Bool = false
     @Published var error: BookError?
     @Published var bookmarkAlert: BookmarkAlert?
     @Published var isCurrentPageBookmarked: Bool = false
@@ -48,6 +50,7 @@ class ReaderViewModel: ObservableObject {
     private var availableViewSize: CGSize?
     private var activePaginationDescriptor: PageCacheDescriptor?
     private var paginationGeneration = 0
+    private var paginationCancellationToken: PaginationCancellationToken?
 
     /// 获取可用视图尺寸，如果尚未设置则回退到屏幕尺寸减去安全区域估算值
     private var effectiveViewSize: CGSize {
@@ -72,7 +75,22 @@ class ReaderViewModel: ObservableObject {
     private let saveProgressUseCase: SaveProgressUseCaseProtocol
     private let paginationService: ReaderPaginationServiceProtocol
     private var cancellables = Set<AnyCancellable>()
+    private var progressSaveCancellable: AnyCancellable?
+    private var progressSaveWorkItem: DispatchWorkItem?
     private var currentBookmarks: [Bookmark] = []
+    private var pendingProgressSave: ProgressSnapshot?
+    private var needsProgressRefreshWhenPaginationCompletes = false
+
+    private struct ProgressSnapshot {
+        let chapterIndex: Int
+        let contentOffset: Int
+        let isCompleted: Bool
+    }
+
+    private struct ReadingLocation {
+        let chapterIndex: Int
+        let contentOffset: Int
+    }
 
     /// 从数据库获取的最新阅读进度（解决 book 对象快照过时问题）
     private var savedChapterIndex: Int
@@ -100,10 +118,11 @@ class ReaderViewModel: ObservableObject {
 
     /// 当前章节内的页面进度（章节内第几页/章节总页数）
     var chapterPageProgress: (current: Int, total: Int) {
-        guard let page = currentPage else { return (0, 0) }
-        let chapterPages = pages.filter { $0.chapterIndex == page.chapterIndex }
-        let currentInChapter = chapterPages.firstIndex { $0.globalIndex == page.globalIndex }.map { $0 + 1 } ?? 0
-        return (currentInChapter, chapterPages.count)
+        guard let page = currentPage,
+              let range = ReaderPageLocator.chapterRange(page.chapterIndex, in: pages) else {
+            return (0, 0)
+        }
+        return (currentPageIndex - range.lowerBound + 1, range.count)
     }
 
     /// 总页数
@@ -172,6 +191,19 @@ class ReaderViewModel: ObservableObject {
                 self?.repaginate()
             }
             .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.flushProgress()
+            }
+            .store(in: &cancellables)
+    }
+
+    deinit {
+        paginationCancellationToken?.cancel()
+        progressSaveWorkItem?.cancel()
+        progressSaveCancellable?.cancel()
     }
 
     /// 设置实际可用的视图尺寸（由 ReaderView 调用）
@@ -214,26 +246,40 @@ class ReaderViewModel: ObservableObject {
 
     /// loadBook 的后续逻辑（获取最新进度和章节后执行）
     private func continueLoadBook(with chapters: [Chapter]) {
-
-        // 先检查页面缓存
+        // 缓存文件可能很大，读取和 JSON 解码不能占用主线程。
+        paginationCancellationToken?.cancel()
         let descriptor = makePaginationDescriptor()
-        if let cachedPages = PageCacheManager.shared.loadCache(for: book.id, expectedDescriptor: descriptor) {
-            print("Loaded \(cachedPages.count) pages from cache")
-            self.activePaginationDescriptor = descriptor
-            self.pages = cachedPages
-            self.pagesVersion += 1
+        let bookId = book.id
+        paginationGeneration += 1
+        let generation = paginationGeneration
 
-            // 加载书签
-            loadBookmarks()
+        DispatchQueue.global(qos: .utility).async {
+            let cachedPages = PageCacheManager.shared.loadCache(
+                for: bookId,
+                expectedDescriptor: descriptor,
+                chapters: chapters
+            )
 
-            // 跳转到保存的位置（此时 isLoading 仍为 true，跳转完成后设为 false）
-            jumpToSavedPosition()
-            return
-        }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, generation == self.paginationGeneration else { return }
+                self.loadBookmarks()
 
-        loadBookmarks()
-        paginateAllChapters { [weak self] in
-            self?.jumpToSavedPosition()
+                if let cachedPages {
+                    self.isPreparingRemainingPages = false
+                    self.activePaginationDescriptor = descriptor
+                    self.pages = cachedPages
+                    self.pagesVersion += 1
+                    self.jumpToSavedPosition()
+                } else {
+                    self.paginateChapters(
+                        focusedAt: self.savedChapterIndex,
+                        initialLocation: ReadingLocation(
+                            chapterIndex: self.savedChapterIndex,
+                            contentOffset: self.savedContentOffset
+                        )
+                    )
+                }
+            }
         }
     }
 
@@ -242,10 +288,11 @@ class ReaderViewModel: ObservableObject {
         let targetChapter = savedChapterIndex
         let targetContentOffset = savedContentOffset
 
-        guard let targetPage = pageContaining(
-            chapterIndex: targetChapter,
-            contentOffset: targetContentOffset
-        ), let globalIndex = pages.firstIndex(where: { $0.globalIndex == targetPage.globalIndex }) else {
+        guard let pageIndex = ReaderPageLocator.pageIndex(
+            containing: targetContentOffset,
+            inChapter: targetChapter,
+            pages: pages
+        ) else {
             currentPageIndex = 0
             currentChapterIndex = pages.first?.chapterIndex ?? 0
             updateProgress()
@@ -254,8 +301,8 @@ class ReaderViewModel: ObservableObject {
             return
         }
 
-        currentPageIndex = globalIndex
-        currentChapterIndex = targetPage.chapterIndex
+        currentPageIndex = pageIndex
+        currentChapterIndex = pages[pageIndex].chapterIndex
 
         updateProgress()
         isLoading = false
@@ -281,11 +328,17 @@ class ReaderViewModel: ObservableObject {
             .store(in: &cancellables)
     }
 
-    /// 对所有章节进行统一分页（在后台线程执行，避免阻塞UI）
-    private func paginateAllChapters(completion: (() -> Void)? = nil) {
+    /// 先发布当前章节，再发布相邻章节，最后在后台补齐全书分页。
+    private func paginateChapters(
+        focusedAt requestedChapterIndex: Int,
+        initialLocation: ReadingLocation,
+        onInitialPagesReady: (() -> Void)? = nil
+    ) {
         guard !chapters.isEmpty else {
             pages = []
-            completion?()
+            isPreparingRemainingPages = false
+            isLoading = false
+            onInitialPagesReady?()
             return
         }
 
@@ -293,30 +346,145 @@ class ReaderViewModel: ObservableObject {
         let chaptersCopy = self.chapters
         let bookId = self.book.id
         let paginationService = self.paginationService
+        let focusedChapterIndex = min(max(0, requestedChapterIndex), chaptersCopy.count - 1)
+        let normalizedInitialLocation = ReadingLocation(
+            chapterIndex: focusedChapterIndex,
+            contentOffset: initialLocation.chapterIndex == focusedChapterIndex
+                ? initialLocation.contentOffset
+                : 0
+        )
+        let priorityOrder = ReaderPaginationPlan.priorityOrder(
+            chapterCount: chaptersCopy.count,
+            focusedChapterIndex: focusedChapterIndex
+        )
+        let adjacentIndexes = ReaderPaginationPlan.focusedAndAdjacentIndexes(
+            chapterCount: chaptersCopy.count,
+            focusedChapterIndex: focusedChapterIndex
+        )
+        let adjacentIndexSet = Set(adjacentIndexes)
+
+        paginationCancellationToken?.cancel()
+        let cancellationToken = PaginationCancellationToken()
+        paginationCancellationToken = cancellationToken
         paginationGeneration += 1
         let generation = paginationGeneration
+        isPreparingRemainingPages = chaptersCopy.count > 1
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
-            let allPages = paginationService.paginate(chapters: chaptersCopy, descriptor: descriptor)
+        DispatchQueue.global(qos: .userInitiated).async {
+            var pagesByChapter: [Int: [Page]] = [:]
+            var didPublishInitialPages = false
+            var didPublishAdjacentPages = false
 
-            DispatchQueue.main.async {
-                guard generation == self.paginationGeneration else { return }
-                self.activePaginationDescriptor = descriptor
-                self.pages = allPages
-                self.pagesVersion += 1
+            for chapterIndex in priorityOrder {
+                guard !cancellationToken.isCancelled else { return }
+                pagesByChapter[chapterIndex] = paginationService.paginateChapter(
+                    chaptersCopy[chapterIndex],
+                    chapterIndex: chapterIndex,
+                    descriptor: descriptor,
+                    cancellationToken: cancellationToken
+                )
+                guard !cancellationToken.isCancelled else { return }
 
-                DispatchQueue.global(qos: .utility).async {
-                    PageCacheManager.shared.saveCache(
-                        pages: allPages,
-                        for: bookId,
-                        descriptor: descriptor
-                    )
+                let loadedIndexes = Set(pagesByChapter.keys)
+                let adjacentPagesAreReady = adjacentIndexSet.isSubset(of: loadedIndexes)
+                let isFinalStage = loadedIndexes.count == chaptersCopy.count
+                let shouldPublish = !didPublishInitialPages
+                    || (adjacentPagesAreReady && !didPublishAdjacentPages)
+                    || isFinalStage
+                guard shouldPublish else { continue }
+
+                let stageIndexes: [Int]
+                if isFinalStage {
+                    stageIndexes = Array(chaptersCopy.indices)
+                } else if !didPublishInitialPages, adjacentPagesAreReady {
+                    // 保存位置所在章节及其相邻章节都为空时，继续向外寻找首个可显示章节。
+                    stageIndexes = loadedIndexes.sorted()
+                } else if adjacentPagesAreReady {
+                    stageIndexes = adjacentIndexes
+                } else {
+                    stageIndexes = [focusedChapterIndex]
+                }
+                let stagePages = ReaderPaginationPlan.mergedPages(
+                    chapterIndexes: stageIndexes,
+                    pagesByChapter: pagesByChapter
+                )
+                guard !stagePages.isEmpty || isFinalStage else { continue }
+
+                let isInitialStage = !didPublishInitialPages
+                didPublishInitialPages = true
+                if adjacentPagesAreReady {
+                    didPublishAdjacentPages = true
                 }
 
-                // 调用完成回调
-                completion?()
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,
+                          generation == self.paginationGeneration,
+                          !cancellationToken.isCancelled else { return }
+                    let location = isInitialStage
+                        ? normalizedInitialLocation
+                        : self.currentReadingLocation ?? normalizedInitialLocation
+                    self.applyPaginationStage(
+                        stagePages,
+                        descriptor: descriptor,
+                        location: location,
+                        isFinalStage: isFinalStage
+                    )
+
+                    if isInitialStage {
+                        onInitialPagesReady?()
+                    }
+
+                    if isFinalStage {
+                        DispatchQueue.global(qos: .utility).async {
+                            PageCacheManager.shared.saveCache(
+                                pages: stagePages,
+                                for: bookId,
+                                descriptor: descriptor
+                            )
+                        }
+                    }
+                }
             }
+        }
+    }
+
+    private var currentReadingLocation: ReadingLocation? {
+        guard let page = currentPage else { return nil }
+        return ReadingLocation(
+            chapterIndex: page.chapterIndex,
+            contentOffset: page.contentOffset
+        )
+    }
+
+    private func applyPaginationStage(
+        _ newPages: [Page],
+        descriptor: PageCacheDescriptor,
+        location: ReadingLocation,
+        isFinalStage: Bool
+    ) {
+        activePaginationDescriptor = descriptor
+        isPreparingRemainingPages = !isFinalStage
+        pages = newPages
+        pagesVersion += 1
+
+        if let pageIndex = ReaderPageLocator.pageIndex(
+            containing: location.contentOffset,
+            inChapter: location.chapterIndex,
+            pages: pages
+        ) {
+            currentPageIndex = pageIndex
+            currentChapterIndex = pages[pageIndex].chapterIndex
+        } else {
+            currentPageIndex = 0
+            currentChapterIndex = pages.first?.chapterIndex ?? location.chapterIndex
+        }
+
+        updateProgress()
+        isLoading = false
+        checkCurrentPageBookmark()
+        if isFinalStage, needsProgressRefreshWhenPaginationCompletes {
+            needsProgressRefreshWhenPaginationCompletes = false
+            saveProgress()
         }
     }
 
@@ -325,39 +493,36 @@ class ReaderViewModel: ObservableObject {
         PageCacheManager.shared.clearCache(for: book.id)
 
         // 保存当前页面的 contentOffset 和章节索引，用于重分页后定位
-        let savedContentOffset = currentPage?.contentOffset ?? 0
-        let savedChapterIndex = currentChapterIndex
-
-        paginateAllChapters { [weak self] in
-            guard let self = self else { return }
-
-            if let targetPage = self.pageContaining(
-                chapterIndex: savedChapterIndex,
-                contentOffset: savedContentOffset
-            ), let pageIndex = self.pages.firstIndex(where: { $0.globalIndex == targetPage.globalIndex }) {
-                self.currentPageIndex = pageIndex
-                self.currentChapterIndex = targetPage.chapterIndex
-            } else {
-                self.currentPageIndex = 0
-                self.currentChapterIndex = self.pages.first?.chapterIndex ?? 0
-            }
-
-            self.updateProgress()
-            self.checkCurrentPageBookmark()
-        }
+        let location = currentReadingLocation ?? ReadingLocation(
+            chapterIndex: currentChapterIndex,
+            contentOffset: 0
+        )
+        paginateChapters(
+            focusedAt: location.chapterIndex,
+            initialLocation: location
+        )
     }
 
     /// 上一章
     func previousChapter() {
         guard hasPreviousChapter else { return }
-        currentChapterIndex -= 1
+        let targetChapterIndex = currentChapterIndex - 1
+        guard let chapterRange = ReaderPageLocator.chapterRange(targetChapterIndex, in: pages) else {
+            currentChapterIndex = targetChapterIndex
+            paginateChapters(
+                focusedAt: targetChapterIndex,
+                initialLocation: ReadingLocation(
+                    chapterIndex: targetChapterIndex,
+                    contentOffset: Int.max
+                ),
+                onInitialPagesReady: { [weak self] in self?.saveProgress() }
+            )
+            return
+        }
+        currentChapterIndex = targetChapterIndex
 
         // 跳转到上一章的最后一页（该章节中 contentOffset 最大的页面）
-        let chapterPages = pages.filter { $0.chapterIndex == currentChapterIndex }
-        if let lastPageOfChapter = chapterPages.max(by: { $0.contentOffset < $1.contentOffset }),
-           let pageIndex = pages.firstIndex(where: { $0.globalIndex == lastPageOfChapter.globalIndex }) {
-            currentPageIndex = pageIndex
-        }
+        currentPageIndex = chapterRange.upperBound - 1
 
         updateProgress()
         saveProgress()
@@ -367,14 +532,23 @@ class ReaderViewModel: ObservableObject {
     /// 下一章
     func nextChapter() {
         guard hasNextChapter else { return }
-        currentChapterIndex += 1
+        let targetChapterIndex = currentChapterIndex + 1
+        guard let chapterRange = ReaderPageLocator.chapterRange(targetChapterIndex, in: pages) else {
+            currentChapterIndex = targetChapterIndex
+            paginateChapters(
+                focusedAt: targetChapterIndex,
+                initialLocation: ReadingLocation(
+                    chapterIndex: targetChapterIndex,
+                    contentOffset: 0
+                ),
+                onInitialPagesReady: { [weak self] in self?.saveProgress() }
+            )
+            return
+        }
+        currentChapterIndex = targetChapterIndex
 
         // 跳转到下一章的第一页（该章节中 contentOffset 最小的页面）
-        let chapterPages = pages.filter { $0.chapterIndex == currentChapterIndex }
-        if let firstPageOfChapter = chapterPages.min(by: { $0.contentOffset < $1.contentOffset }),
-           let pageIndex = pages.firstIndex(where: { $0.globalIndex == firstPageOfChapter.globalIndex }) {
-            currentPageIndex = pageIndex
-        }
+        currentPageIndex = chapterRange.lowerBound
 
         updateProgress()
         saveProgress()
@@ -387,11 +561,15 @@ class ReaderViewModel: ObservableObject {
         currentChapterIndex = index
 
         // 跳转到该章节的第一页（contentOffset 最小的页面）
-        let chapterPages = pages.filter { $0.chapterIndex == index }
-        if let firstPageOfChapter = chapterPages.min(by: { $0.contentOffset < $1.contentOffset }),
-           let pageIndex = pages.firstIndex(where: { $0.globalIndex == firstPageOfChapter.globalIndex }) {
-            currentPageIndex = pageIndex
+        guard let chapterRange = ReaderPageLocator.chapterRange(index, in: pages) else {
+            paginateChapters(
+                focusedAt: index,
+                initialLocation: ReadingLocation(chapterIndex: index, contentOffset: 0),
+                onInitialPagesReady: { [weak self] in self?.saveProgress() }
+            )
+            return
         }
+        currentPageIndex = chapterRange.lowerBound
 
         updateProgress()
         saveProgress()
@@ -400,7 +578,7 @@ class ReaderViewModel: ObservableObject {
 
     /// 跳转到进度位置
     func jumpToProgress(_ progress: Double) {
-        guard !pages.isEmpty else { return }
+        guard !pages.isEmpty, !isPreparingRemainingPages else { return }
         let targetPage = Int(Double(pages.count - 1) * progress)
         currentPageIndex = max(0, min(targetPage, pages.count - 1))
 
@@ -425,11 +603,13 @@ class ReaderViewModel: ObservableObject {
             currentChapterIndex = page.chapterIndex
         }
 
-        // 使用 async 避免在视图更新期间发布状态变化
-        DispatchQueue.main.async {
-            self.updateProgress()
-            self.saveProgress()
-            self.checkCurrentPageBookmark()
+        // 先记录待保存位置，避免退出或切后台时早于异步界面更新触发 flushProgress。
+        saveProgress()
+
+        // 使用 async 避免在视图更新期间发布状态变化。
+        DispatchQueue.main.async { [weak self] in
+            self?.updateProgress()
+            self?.checkCurrentPageBookmark()
         }
     }
 
@@ -437,6 +617,21 @@ class ReaderViewModel: ObservableObject {
     private func updateProgress() {
         guard !pages.isEmpty else {
             readingProgress = 0
+            return
+        }
+        if isPreparingRemainingPages,
+           let page = currentPage,
+           let chapter = chapters[safe: page.chapterIndex],
+           !chapters.isEmpty {
+            let chapterLength = max(1, (chapter.content as NSString).length)
+            let chapterProgress = min(
+                1,
+                max(0, Double(page.contentOffset) / Double(chapterLength))
+            )
+            readingProgress = min(
+                0.999,
+                (Double(page.chapterIndex) + chapterProgress) / Double(chapters.count)
+            )
             return
         }
         guard pages.count > 1 else {
@@ -950,24 +1145,51 @@ class ReaderViewModel: ObservableObject {
     /// 保存阅读进度
     private func saveProgress() {
         guard let page = currentPage else { return }
+        if isPreparingRemainingPages {
+            needsProgressRefreshWhenPaginationCompletes = true
+        }
 
-        // 保存章节索引和精确的 contentOffset
-        saveProgressUseCase.execute(
-            bookId: book.id,
+        pendingProgressSave = ProgressSnapshot(
             chapterIndex: currentChapterIndex,
             contentOffset: page.contentOffset,
-            isCompleted: currentPageIndex == pages.count - 1
+            isCompleted: !isPreparingRemainingPages && currentPageIndex == pages.count - 1
+        )
+        progressSaveWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.flushProgress()
+        }
+        progressSaveWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
+    }
+
+    /// 退出阅读器或应用进入后台时立即提交最后一个阅读位置。
+    func flushProgress() {
+        progressSaveWorkItem?.cancel()
+        progressSaveWorkItem = nil
+        guard let snapshot = pendingProgressSave else { return }
+        pendingProgressSave = nil
+
+        progressSaveCancellable?.cancel()
+        progressSaveCancellable = saveProgressUseCase.execute(
+            bookId: book.id,
+            chapterIndex: snapshot.chapterIndex,
+            contentOffset: snapshot.contentOffset,
+            isCompleted: snapshot.isCompleted
         )
         .receive(on: DispatchQueue.main)
         .sink(
             receiveCompletion: { [weak self] completion in
                 if case .failure(let error) = completion {
-                    self?.presentOperationError(title: "进度保存失败", error: error)
+                    guard let self else { return }
+                    if self.pendingProgressSave == nil {
+                        self.pendingProgressSave = snapshot
+                    }
+                    self.presentOperationError(title: "进度保存失败", error: error)
                 }
             },
             receiveValue: { _ in }
         )
-        .store(in: &cancellables)
     }
 
     // MARK: - 书签功能
@@ -1040,15 +1262,26 @@ class ReaderViewModel: ObservableObject {
     /// 跳转到书签所在章节
     func jumpToBookmark(_ bookmark: Bookmark) {
         guard bookmark.type == .bookmark else { return }
-        if let targetPage = pageContaining(
-            chapterIndex: bookmark.chapterIndex,
-            contentOffset: bookmark.location
-        ), let pageIndex = pages.firstIndex(where: { $0.globalIndex == targetPage.globalIndex }) {
+        if let pageIndex = ReaderPageLocator.pageIndex(
+            containing: bookmark.location,
+            inChapter: bookmark.chapterIndex,
+            pages: pages
+        ) {
             currentPageIndex = pageIndex
-            currentChapterIndex = targetPage.chapterIndex
+            currentChapterIndex = pages[pageIndex].chapterIndex
             updateProgress()
             saveProgress()
             checkCurrentPageBookmark()
+        } else if chapters.indices.contains(bookmark.chapterIndex) {
+            currentChapterIndex = bookmark.chapterIndex
+            paginateChapters(
+                focusedAt: bookmark.chapterIndex,
+                initialLocation: ReadingLocation(
+                    chapterIndex: bookmark.chapterIndex,
+                    contentOffset: bookmark.location
+                ),
+                onInitialPagesReady: { [weak self] in self?.saveProgress() }
+            )
         }
         showBookmarkList = false
     }
@@ -1073,17 +1306,12 @@ class ReaderViewModel: ObservableObject {
             .store(in: &cancellables)
     }
 
-    private func pageContaining(chapterIndex: Int, contentOffset: Int) -> Page? {
-        let chapterPages = pages.filter { $0.chapterIndex == chapterIndex }
-        return chapterPages.last { $0.contentOffset <= contentOffset } ?? chapterPages.first
-    }
-
     private func bookmarkOnCurrentPage() -> Bookmark? {
         guard let page = currentPage else { return nil }
-        let nextOffset = pages
-            .dropFirst(currentPageIndex + 1)
-            .first { $0.chapterIndex == page.chapterIndex }?
-            .contentOffset ?? Int.max
+        let nextOffset = ReaderPageLocator.nextContentOffset(
+            after: currentPageIndex,
+            in: pages
+        ) ?? Int.max
 
         return currentBookmarks.first {
             $0.type == .bookmark
