@@ -115,6 +115,94 @@ struct BookReaderTests {
         #expect(FileManager.default.fileExists(atPath: unrelatedDirectory.path))
     }
 
+    @Test func wifiTemporaryUploadCleanupOnlyRemovesOrphanedBatchDirectories() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BookReaderWiFiUploadCleanupTest-\(UUID().uuidString)", isDirectory: true)
+        let orphanedBatch = directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let unrelatedDirectory = directory.appendingPathComponent("keep", isDirectory: true)
+        let unrelatedFile = directory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: orphanedBatch, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: unrelatedDirectory, withIntermediateDirectories: true)
+        try Data("keep".utf8).write(to: unrelatedFile)
+
+        WiFiTemporaryUploadStore.cleanupOrphanedDirectories(in: directory)
+
+        #expect(!FileManager.default.fileExists(atPath: orphanedBatch.path))
+        #expect(FileManager.default.fileExists(atPath: unrelatedDirectory.path))
+        #expect(FileManager.default.fileExists(atPath: unrelatedFile.path))
+    }
+
+    @Test func wifiTemporarySpaceBudgetCountsReservationsAndPendingFiles() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BookReaderWiFiBudgetTest-\(UUID().uuidString)", isDirectory: true)
+        let bodies = root.appendingPathComponent("bodies", isDirectory: true)
+        let uploads = root.appendingPathComponent("uploads", isDirectory: true)
+        let batch = uploads.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let receivedFile = batch.appendingPathComponent("pending.txt")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: bodies, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: batch, withIntermediateDirectories: true)
+        let budget = WiFiTemporarySpaceBudget(maximumBytes: 100, directories: [bodies, uploads])
+
+        func isQuotaRejected(for size: Int) -> Bool {
+            do {
+                let unexpected = try budget.reserve(requestBodyBytes: size)
+                unexpected.release()
+                return false
+            } catch WiFiTemporarySpaceError.quotaExceeded {
+                return true
+            } catch {
+                return false
+            }
+        }
+
+        let first = try budget.reserve(requestBodyBytes: 40)
+        #expect(isQuotaRejected(for: 11))
+        first.release()
+
+        try Data(repeating: 0x61, count: 35).write(to: receivedFile)
+        let second = try budget.reserve(requestBodyBytes: 30)
+        #expect(isQuotaRejected(for: 3))
+        second.release()
+        try FileManager.default.removeItem(at: receivedFile)
+
+        let third = try budget.reserve(requestBodyBytes: 40)
+        third.release()
+    }
+
+    @Test func wifiFileCopyStopsBetweenChunks() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BookReaderWiFiCopyTest-\(UUID().uuidString)", isDirectory: true)
+        let source = root.appendingPathComponent("source.txt")
+        let destination = root.appendingPathComponent("destination.txt")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let payload = Data(repeating: 0x61, count: 256 * 1024)
+        try payload.write(to: source)
+
+        var checks = 0
+        var wasCancelled = false
+        do {
+            try WiFiFileRangeCopier.copy(
+                0..<payload.count,
+                from: source,
+                to: destination,
+                chunkSize: 64 * 1024,
+                isActive: {
+                    checks += 1
+                    return checks <= 2
+                }
+            )
+        } catch is CancellationError {
+            wasCancelled = true
+        }
+
+        let writtenBytes = try FileManager.default.attributesOfItem(atPath: destination.path)[.size] as? Int
+        #expect(wasCancelled)
+        #expect(writtenBytes == 64 * 1024)
+    }
+
     @Test @MainActor func wifiTransferReceivesMultipartAndStopsItsHTTPServer() async throws {
         let service = WiFiTransferService.shared
         let recorder = WiFiReceivedFilesRecorder()
@@ -174,6 +262,38 @@ struct BookReaderTests {
         let portNumber = try #require(components.port)
         let port = try #require(NWEndpoint.Port(rawValue: UInt16(portNumber)))
         let query = try #require(components.percentEncodedQuery)
+        let idleConnection = NWConnection(
+            host: NWEndpoint.Host("127.0.0.1"),
+            port: port,
+            using: .tcp
+        )
+        let idleProbe = WiFiConnectionProbe()
+        idleConnection.stateUpdateHandler = { state in
+            if case .ready = state {
+                idleProbe.markReady()
+            }
+            if case .failed = state {
+                idleProbe.markClosed()
+            }
+        }
+        idleConnection.start(queue: DispatchQueue(label: "com.bookreader.tests.idle-upload"))
+        defer { idleConnection.cancel() }
+        for _ in 0..<100 where !idleProbe.isReady {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        try #require(idleProbe.isReady)
+        idleConnection.receive(minimumIncompleteLength: 1, maximumLength: 1_024) { _, _, isComplete, error in
+            if isComplete || error != nil {
+                idleProbe.markClosed()
+            }
+        }
+        let idleStart = ProcessInfo.processInfo.systemUptime
+        for _ in 0..<180 where !idleProbe.isClosed {
+            try await Task.sleep(nanoseconds: 250_000_000)
+        }
+        #expect(idleProbe.isClosed)
+        #expect(ProcessInfo.processInfo.systemUptime - idleStart >= 29)
+
         let pendingConnection = NWConnection(
             host: NWEndpoint.Host("127.0.0.1"),
             port: port,

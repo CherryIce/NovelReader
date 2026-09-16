@@ -177,6 +177,177 @@ enum WiFiTemporaryBodyStore {
     }
 }
 
+/// 只清理本服务创建的批次目录，避免异常退出后接收文件长期占用磁盘。
+enum WiFiTemporaryUploadStore {
+    static let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("BookReaderWiFiUploads", isDirectory: true)
+
+    static func cleanupOrphanedDirectories(in directory: URL = WiFiTemporaryUploadStore.directory) {
+        let fileManager = FileManager.default
+        guard let contents = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey]
+        ) else {
+            return
+        }
+        for url in contents where UUID(uuidString: url.lastPathComponent) != nil {
+            guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
+                continue
+            }
+            try? fileManager.removeItem(at: url)
+        }
+    }
+}
+
+enum WiFiTemporarySpaceError: Error {
+    case quotaExceeded
+}
+
+/// 为请求体及其解包副本预留空间，同时计入尚未导入的接收文件。
+final class WiFiTemporarySpaceBudget {
+    final class Reservation {
+        private let lock = NSLock()
+        private weak var budget: WiFiTemporarySpaceBudget?
+        private let id: UUID
+
+        fileprivate init(budget: WiFiTemporarySpaceBudget, id: UUID) {
+            self.budget = budget
+            self.id = id
+        }
+
+        func release() {
+            lock.lock()
+            let budget = self.budget
+            self.budget = nil
+            lock.unlock()
+            budget?.release(id)
+        }
+
+        deinit {
+            release()
+        }
+    }
+
+    private let lock = NSLock()
+    private let maximumBytes: Int
+    private let directories: [URL]
+    private var reservations: [UUID: Int] = [:]
+
+    init(
+        maximumBytes: Int = 512 * 1024 * 1024,
+        directories: [URL] = [WiFiTemporaryBodyStore.directory, WiFiTemporaryUploadStore.directory]
+    ) {
+        self.maximumBytes = max(1, maximumBytes)
+        self.directories = directories
+    }
+
+    func reserve(requestBodyBytes: Int) throws -> Reservation {
+        let (peakBytes, overflow) = requestBodyBytes.multipliedReportingOverflow(by: 2)
+        guard requestBodyBytes > 0, !overflow, peakBytes <= maximumBytes else {
+            throw WiFiTemporarySpaceError.quotaExceeded
+        }
+
+        lock.lock()
+        defer { lock.unlock() }
+        var occupiedBytes = 0
+        for directory in directories {
+            let (sum, overflow) = occupiedBytes.addingReportingOverflow(try storedBytes(in: directory))
+            guard !overflow else { throw WiFiTemporarySpaceError.quotaExceeded }
+            occupiedBytes = sum
+        }
+        let reservedBytes = reservations.values.reduce(0, +)
+        guard occupiedBytes <= maximumBytes,
+              reservedBytes <= maximumBytes - occupiedBytes,
+              peakBytes <= maximumBytes - occupiedBytes - reservedBytes else {
+            throw WiFiTemporarySpaceError.quotaExceeded
+        }
+
+        let id = UUID()
+        reservations[id] = peakBytes
+        return Reservation(budget: self, id: id)
+    }
+
+    private func release(_ id: UUID) {
+        lock.lock()
+        reservations.removeValue(forKey: id)
+        lock.unlock()
+    }
+
+    private func storedBytes(in directory: URL) throws -> Int {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: directory.path) else { return 0 }
+        let contents: [URL]
+        do {
+            contents = try fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey],
+                options: []
+            )
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain
+            && error.code == CocoaError.Code.fileReadNoSuchFile.rawValue {
+            return 0
+        }
+        var total = 0
+        for url in contents {
+            let values: URLResourceValues
+            do {
+                values = try url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey])
+            } catch let error as NSError where error.domain == NSCocoaErrorDomain
+                && error.code == CocoaError.Code.fileReadNoSuchFile.rawValue {
+                continue
+            }
+            let size: Int
+            if values.isDirectory == true {
+                size = try storedBytes(in: url)
+            } else if values.isRegularFile == true {
+                guard let fileSize = values.fileSize else { throw CocoaError(.fileReadUnknown) }
+                size = fileSize
+            } else {
+                continue
+            }
+            let (sum, overflow) = total.addingReportingOverflow(size)
+            guard !overflow else { throw WiFiTemporarySpaceError.quotaExceeded }
+            total = sum
+        }
+        return total
+    }
+}
+
+enum WiFiFileRangeCopier {
+    static func copy(
+        _ range: Range<Data.Index>,
+        from sourceURL: URL,
+        to destinationURL: URL,
+        chunkSize: Int,
+        isActive: () -> Bool
+    ) throws {
+        guard isActive() else { throw CancellationError() }
+        guard chunkSize > 0 else { throw CocoaError(.fileReadUnknown) }
+        guard FileManager.default.createFile(atPath: destinationURL.path, contents: nil) else {
+            throw CocoaError(.fileWriteFileExists)
+        }
+
+        let source = try FileHandle(forReadingFrom: sourceURL)
+        defer { try? source.close() }
+        let destination = try FileHandle(forWritingTo: destinationURL)
+        defer { try? destination.close() }
+
+        try source.seek(toOffset: UInt64(range.lowerBound))
+        var remaining = range.count
+        while remaining > 0 {
+            guard isActive() else { throw CancellationError() }
+            let length = min(chunkSize, remaining)
+            guard let chunk = try source.read(upToCount: length), !chunk.isEmpty else {
+                throw CocoaError(.fileReadUnknown)
+            }
+            try destination.write(contentsOf: chunk)
+            remaining -= chunk.count
+        }
+        guard isActive() else { throw CancellationError() }
+        try destination.synchronize()
+    }
+}
+
 /// WiFi 传书服务 - 在本地局域网启动 HTTP 服务器，允许用户通过浏览器上传书籍
 final class WiFiTransferService: NSObject, ObservableObject {
     static let shared = WiFiTransferService()
@@ -197,6 +368,7 @@ final class WiFiTransferService: NSObject, ObservableObject {
     private let connectionIdleTimeout: TimeInterval = 30
     private let connectionSweepInterval: TimeInterval = 5
     private let sessionGate = WiFiTransferSessionGate()
+    private let temporarySpaceBudget = WiFiTemporarySpaceBudget()
     private var connectionSweepTimer: DispatchSourceTimer?
 
     private final class RequestBuffer {
@@ -206,17 +378,25 @@ final class WiFiTransferService: NSObject, ObservableObject {
     /// 将上传请求体直接写入临时文件，避免在堆内存中累积最多 202MB 的 Data。
     private final class TemporaryRequestBody {
         let url: URL
+        private let reservation: WiFiTemporarySpaceBudget.Reservation
         private var handle: FileHandle?
         private(set) var count = 0
 
-        init() throws {
+        init(reservation: WiFiTemporarySpaceBudget.Reservation) throws {
+            self.reservation = reservation
             let directory = WiFiTemporaryBodyStore.directory
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             url = directory.appendingPathComponent(UUID().uuidString, isDirectory: false)
-            guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
-                throw CocoaError(.fileWriteUnknown)
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+                    throw CocoaError(.fileWriteUnknown)
+                }
+                handle = try FileHandle(forWritingTo: url)
+            } catch {
+                try? FileManager.default.removeItem(at: url)
+                reservation.release()
+                throw error
             }
-            handle = try FileHandle(forWritingTo: url)
         }
 
         func append(_ data: Data, expectedLength: Int) throws -> Bool {
@@ -237,6 +417,7 @@ final class WiFiTransferService: NSObject, ObservableObject {
             try? handle?.close()
             handle = nil
             try? FileManager.default.removeItem(at: url)
+            reservation.release()
         }
 
         deinit {
@@ -247,6 +428,7 @@ final class WiFiTransferService: NSObject, ObservableObject {
     private override init() {
         super.init()
         WiFiTemporaryBodyStore.cleanupOrphanedFiles()
+        WiFiTemporaryUploadStore.cleanupOrphanedDirectories()
     }
 
     /// 获取本机 IP 地址
@@ -482,8 +664,19 @@ final class WiFiTransferService: NSObject, ObservableObject {
                     return
                 }
 
+                let reservation: WiFiTemporarySpaceBudget.Reservation
                 do {
-                    let requestBody = try TemporaryRequestBody()
+                    reservation = try self.temporarySpaceBudget.reserve(requestBodyBytes: contentLength)
+                } catch WiFiTemporarySpaceError.quotaExceeded {
+                    self.sendResponse(connection: connection, statusCode: 507, body: "Temporary Storage Full")
+                    return
+                } catch {
+                    self.sendResponse(connection: connection, statusCode: 500, body: "Unable To Check Storage")
+                    return
+                }
+
+                do {
+                    let requestBody = try TemporaryRequestBody(reservation: reservation)
                     guard try requestBody.append(initialBody, expectedLength: contentLength) else {
                         self.sendResponse(connection: connection, statusCode: 400, body: "Request Body Too Large")
                         return
@@ -509,6 +702,7 @@ final class WiFiTransferService: NSObject, ObservableObject {
                         )
                     }
                 } catch {
+                    reservation.release()
                     self.sendResponse(connection: connection, statusCode: 500, body: "Unable To Store Upload")
                 }
             }
@@ -676,11 +870,15 @@ final class WiFiTransferService: NSObject, ObservableObject {
         var failedFiles: [String] = []
         var uploadedURLs: [URL] = []
         var receivedFilenames = Set<String>()
-        let uploadDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("BookReaderWiFiUploads", isDirectory: true)
+        let connectionID = ObjectIdentifier(connection)
+        let uploadDirectory = WiFiTemporaryUploadStore.directory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
 
         for partRange in partRanges {
+            guard sessionGate.isAuthorized(sessionToken, for: connectionID) else {
+                try? FileManager.default.removeItem(at: uploadDirectory)
+                return
+            }
             guard let parsedPart = parseMultipartFile(in: data, partRange: partRange) else { continue }
             let filename = parsedPart.filename
             guard receivedFilenames.insert(filename.lowercased()).inserted else {
@@ -703,13 +901,18 @@ final class WiFiTransferService: NSObject, ObservableObject {
             let destinationURL = uploadDirectory.appendingPathComponent(filename, isDirectory: false)
             do {
                 try FileManager.default.createDirectory(at: uploadDirectory, withIntermediateDirectories: true)
-                try copyFileRange(
+                try WiFiFileRangeCopier.copy(
                     parsedPart.dataRange,
                     from: bodyFileURL,
-                    to: destinationURL
+                    to: destinationURL,
+                    chunkSize: receiveChunkSize,
+                    isActive: { self.sessionGate.isAuthorized(sessionToken, for: connectionID) }
                 )
                 uploadedFiles.append(filename)
                 uploadedURLs.append(destinationURL)
+            } catch is CancellationError {
+                try? FileManager.default.removeItem(at: uploadDirectory)
+                return
             } catch {
                 try? FileManager.default.removeItem(at: destinationURL)
                 failedFiles.append("\(filename): \(error.localizedDescription)")
@@ -749,35 +952,6 @@ final class WiFiTransferService: NSObject, ObservableObject {
                 "errors": failedFiles
             ])
         }
-    }
-
-    private func copyFileRange(
-        _ range: Range<Data.Index>,
-        from sourceURL: URL,
-        to destinationURL: URL
-    ) throws {
-        guard FileManager.default.createFile(atPath: destinationURL.path, contents: nil) else {
-            throw CocoaError(.fileWriteFileExists)
-        }
-
-        let source = try FileHandle(forReadingFrom: sourceURL)
-        let destination = try FileHandle(forWritingTo: destinationURL)
-        defer {
-            try? source.close()
-            try? destination.close()
-        }
-
-        try source.seek(toOffset: UInt64(range.lowerBound))
-        var remaining = range.count
-        while remaining > 0 {
-            let chunkSize = min(receiveChunkSize, remaining)
-            guard let chunk = try source.read(upToCount: chunkSize), !chunk.isEmpty else {
-                throw CocoaError(.fileReadUnknown)
-            }
-            try destination.write(contentsOf: chunk)
-            remaining -= chunk.count
-        }
-        try destination.synchronize()
     }
 
     private func parseMultipartFile(
@@ -1129,7 +1303,9 @@ final class WiFiTransferService: NSObject, ObservableObject {
                             } else {
                                 result.className = 'result error';
                                 result.style.display = 'block';
-                                result.textContent = '上传失败，请重试';
+                                result.textContent = xhr.status === 507
+                                    ? '临时空间不足，请等待已上传书籍导入完成后重试'
+                                    : '上传失败，请重试';
                             }
                         };
 
@@ -1195,6 +1371,7 @@ final class WiFiTransferService: NSObject, ObservableObject {
         case 413: statusText = "Payload Too Large"
         case 431: statusText = "Request Header Fields Too Large"
         case 500: statusText = "Internal Server Error"
+        case 507: statusText = "Insufficient Storage"
         default: statusText = "Unknown"
         }
 
