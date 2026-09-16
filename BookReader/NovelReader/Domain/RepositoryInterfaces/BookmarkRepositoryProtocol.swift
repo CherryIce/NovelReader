@@ -3,6 +3,9 @@ import Combine
 
 /// 书签仓库协议
 protocol BookmarkRepositoryProtocol {
+    /// 获取所有书籍中的划线和笔记
+    func getAllAnnotations() -> AnyPublisher<[Bookmark], Error>
+
     /// 获取书籍的所有书签
     func getBookmarks(forBookId bookId: UUID) -> AnyPublisher<[Bookmark], Error>
     

@@ -9,6 +9,27 @@ class BookmarkRepository: BookmarkRepositoryProtocol {
         self.context = context
         self.context.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
     }
+
+    func getAllAnnotations() -> AnyPublisher<[Bookmark], Error> {
+        Future { promise in
+            self.context.perform {
+                let request: NSFetchRequest<BookmarkEntity> = BookmarkEntity.fetchRequest()
+                request.predicate = NSPredicate(
+                    format: "type == %@ OR type == %@",
+                    BookmarkType.highlight.rawValue,
+                    BookmarkType.note.rawValue
+                )
+                request.sortDescriptors = [NSSortDescriptor(key: "updatedAt", ascending: false)]
+
+                do {
+                    promise(.success(try self.context.fetch(request).map { $0.toBookmark() }))
+                } catch {
+                    promise(.failure(error))
+                }
+            }
+        }
+        .eraseToAnyPublisher()
+    }
     
     func getBookmarks(forBookId bookId: UUID) -> AnyPublisher<[Bookmark], Error> {
         Future { promise in
