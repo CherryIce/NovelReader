@@ -190,28 +190,8 @@ struct ReaderView: View {
             ReaderTopToolbar(
                 title: viewModel.currentPage?.chapterTitle ?? viewModel.book.title,
                 onBack: { dismiss() },
-                onCatalog: { viewModel.showCatalog = true },
-                onSettings: { viewModel.showSettings = true },
                 onBookmark: { viewModel.toggleBookmark() },
-                onBookmarkList: { viewModel.openBookmarkList() },
-                onSpeech: { viewModel.toggleSpeech() },
-                isSpeaking: viewModel.isSpeaking,
                 isBookmarked: viewModel.isCurrentPageBookmarked
-            )
-            .background(
-                // 轻微渐变遮罩
-                LinearGradient(
-                    colors: [
-                        themeService.currentTheme.backgroundColor,
-                        themeService.currentTheme.backgroundColor.opacity(0.8),
-                        themeService.currentTheme.backgroundColor.opacity(0.0)
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-                .frame(height: 20)
-                .offset(y: 44)
-                .allowsHitTesting(false)
             )
 
             Spacer()
@@ -226,6 +206,8 @@ struct ReaderView: View {
                     onRateChange: { speechService.rate = $0 },
                     onPitchChange: { speechService.pitch = $0 }
                 )
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
@@ -239,22 +221,15 @@ struct ReaderView: View {
                     onNextChapter: { viewModel.nextChapter() },
                     onSliderChange: { value in
                         viewModel.jumpToProgress(value)
-                    }
+                    },
+                    onCatalog: { viewModel.showCatalog = true },
+                    onBookmarkList: { viewModel.openBookmarkList() },
+                    onSpeech: { viewModel.toggleSpeech() },
+                    onSettings: { viewModel.showSettings = true },
+                    isSpeaking: viewModel.isSpeaking
                 )
-                .background(
-                    LinearGradient(
-                        colors: [
-                            themeService.currentTheme.backgroundColor.opacity(0.0),
-                            themeService.currentTheme.backgroundColor.opacity(0.8),
-                            themeService.currentTheme.backgroundColor
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                    .frame(height: 20)
-                    .offset(y: -44)
-                    .allowsHitTesting(false)
-                )
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
             }
         }
     }
@@ -577,56 +552,64 @@ struct PageViewController: UIViewControllerRepresentable {
 struct ReaderTopToolbar: View {
     let title: String
     let onBack: () -> Void
-    let onCatalog: () -> Void
-    let onSettings: () -> Void
     let onBookmark: () -> Void
-    let onBookmarkList: () -> Void
-    let onSpeech: () -> Void
-    let isSpeaking: Bool
     let isBookmarked: Bool
     @ObservedObject private var themeService = ThemeService.shared
     
     var body: some View {
-        HStack {
-            Button(action: onBack) {
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 20, weight: .regular))
-            }
-            
-            Spacer()
-            
+        HStack(spacing: 12) {
+            ReaderToolbarIconButton(
+                systemName: "chevron.left",
+                accessibilityLabel: "返回书架",
+                action: onBack
+            )
+
             Text(title)
-                .font(.subheadline)
+                .font(.system(size: 15, weight: .semibold))
                 .lineLimit(1)
-            
-            Spacer()
-            
-            HStack(spacing: 16) {
-                Button(action: onBookmark) {
-                    Image(systemName: isBookmarked ? "bookmark.fill" : "bookmark")
-                        .foregroundColor(isBookmarked ? .yellow : themeService.currentTheme.textColor)
-                }
+                .frame(maxWidth: .infinity)
 
-                Button(action: onBookmarkList) {
-                    Image(systemName: "list.bullet")
-                }
-
-                Button(action: onCatalog) {
-                    Image(systemName: "textformat.size")
-                }
-
-                Button(action: onSpeech) {
-                    Image(systemName: isSpeaking ? "stop.fill" : "headphones")
-                }
-
-                Button(action: onSettings) {
-                    Image(systemName: "gearshape")
-                }
-            }
+            ReaderToolbarIconButton(
+                systemName: isBookmarked ? "bookmark.fill" : "bookmark",
+                accessibilityLabel: isBookmarked ? "移除当前页书签" : "添加当前页书签",
+                tint: isBookmarked ? .accentColor : themeService.currentTheme.textColor,
+                action: onBookmark
+            )
         }
-        .padding()
-        .background(themeService.currentTheme.backgroundColor)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(themeService.currentTheme.backgroundColor.opacity(0.98))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(themeService.currentTheme.secondaryTextColor.opacity(0.14), lineWidth: 0.5)
+                )
+                .shadow(color: .black.opacity(0.08), radius: 12, x: 0, y: 4)
+        )
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
         .foregroundColor(themeService.currentTheme.textColor)
+    }
+}
+
+private struct ReaderToolbarIconButton: View {
+    let systemName: String
+    let accessibilityLabel: String
+    var tint: Color? = nil
+    let action: () -> Void
+    @ObservedObject private var themeService = ThemeService.shared
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 18, weight: .medium))
+                .foregroundColor(tint ?? themeService.currentTheme.textColor)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel)
     }
 }
 
@@ -639,46 +622,142 @@ struct ReaderBottomToolbar: View {
     let onPreviousChapter: () -> Void
     let onNextChapter: () -> Void
     let onSliderChange: (Double) -> Void
+    let onCatalog: () -> Void
+    let onBookmarkList: () -> Void
+    let onSpeech: () -> Void
+    let onSettings: () -> Void
+    let isSpeaking: Bool
     @ObservedObject private var themeService = ThemeService.shared
     
     var body: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 10) {
-                Slider(
-                    value: Binding(
-                        get: { progress },
-                        set: { onSliderChange($0) }
-                    ),
-                    in: 0...1
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                ReaderChapterButton(
+                    title: "上一章",
+                    systemName: "chevron.left",
+                    isEnabled: hasPreviousChapter,
+                    action: onPreviousChapter
                 )
-                Text("\(Int((progress * 100).rounded()))%")
-                    .font(.system(size: 11))
-                    .frame(width: 36, alignment: .trailing)
-            }
 
-            HStack {
-                Button(action: onPreviousChapter) {
-                    Image(systemName: "backward.end.fill")
-                    Text("上一章")
+                VStack(spacing: 5) {
+                    Slider(
+                        value: Binding(
+                            get: { progress },
+                            set: { onSliderChange($0) }
+                        ),
+                        in: 0...1
+                    )
+                    .tint(.accentColor)
+
+                    HStack {
+                        Text("阅读进度")
+                        Spacer()
+                        Text("\(Int((progress * 100).rounded()))%")
+                            .monospacedDigit()
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(themeService.currentTheme.secondaryTextColor)
                 }
-                .font(.caption)
-                .disabled(!hasPreviousChapter)
-                .opacity(hasPreviousChapter ? 1 : 0.5)
 
-                Spacer()
-
-                Button(action: onNextChapter) {
-                    Text("下一章")
-                    Image(systemName: "forward.end.fill")
-                }
-                .font(.caption)
-                .disabled(!hasNextChapter)
-                .opacity(hasNextChapter ? 1 : 0.5)
+                ReaderChapterButton(
+                    title: "下一章",
+                    systemName: "chevron.right",
+                    isEnabled: hasNextChapter,
+                    action: onNextChapter
+                )
             }
+            .padding(.horizontal, 14)
+            .padding(.top, 12)
+            .padding(.bottom, 10)
+
+            Divider()
+                .overlay(themeService.currentTheme.secondaryTextColor.opacity(0.12))
+
+            HStack(spacing: 4) {
+                ReaderPrimaryToolButton(
+                    title: "目录",
+                    systemName: "list.bullet",
+                    action: onCatalog
+                )
+                ReaderPrimaryToolButton(
+                    title: "书签",
+                    systemName: "bookmark.square",
+                    action: onBookmarkList
+                )
+                ReaderPrimaryToolButton(
+                    title: isSpeaking ? "结束听书" : "听书",
+                    systemName: isSpeaking ? "stop.circle.fill" : "headphones",
+                    isActive: isSpeaking,
+                    action: onSpeech
+                )
+                ReaderPrimaryToolButton(
+                    title: "排版",
+                    systemName: "textformat",
+                    action: onSettings
+                )
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
         }
-        .padding()
-        .background(themeService.currentTheme.backgroundColor)
+        .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(themeService.currentTheme.backgroundColor.opacity(0.98))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .stroke(themeService.currentTheme.secondaryTextColor.opacity(0.14), lineWidth: 0.5)
+                )
+                .shadow(color: .black.opacity(0.1), radius: 16, x: 0, y: 6)
+        )
         .foregroundColor(themeService.currentTheme.textColor)
+    }
+}
+
+private struct ReaderChapterButton: View {
+    let title: String
+    let systemName: String
+    let isEnabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 3) {
+                Image(systemName: systemName)
+                    .font(.system(size: 15, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 10, weight: .medium))
+            }
+            .frame(width: 48, height: 48)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!isEnabled)
+        .opacity(isEnabled ? 1 : 0.32)
+    }
+}
+
+private struct ReaderPrimaryToolButton: View {
+    let title: String
+    let systemName: String
+    var isActive = false
+    let action: () -> Void
+    @ObservedObject private var themeService = ThemeService.shared
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 5) {
+                Image(systemName: systemName)
+                    .font(.system(size: 19, weight: .medium))
+                Text(title)
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+            }
+            .foregroundColor(isActive ? .accentColor : themeService.currentTheme.textColor)
+            .frame(maxWidth: .infinity, minHeight: 52)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isActive ? .isSelected : [])
     }
 }
 
@@ -738,8 +817,16 @@ struct SpeechControlPanel: View {
             }
         }
         .padding(.horizontal, 20)
-        .padding(.vertical, 10)
-        .background(themeService.currentTheme.backgroundColor)
+        .padding(.vertical, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(themeService.currentTheme.backgroundColor.opacity(0.98))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .stroke(themeService.currentTheme.secondaryTextColor.opacity(0.14), lineWidth: 0.5)
+                )
+                .shadow(color: .black.opacity(0.08), radius: 12, x: 0, y: 4)
+        )
         .foregroundColor(themeService.currentTheme.textColor)
     }
 }
