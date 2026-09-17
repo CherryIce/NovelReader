@@ -61,16 +61,47 @@ struct ChapterPositionMapper {
 
     func map(chapterIndex: Int, contentOffset: Int) -> ChapterPosition? {
         guard let oldChapter = oldChapters.first(where: { $0.index == chapterIndex }),
-              let start = contentStarts[chapterIndex],
-              let newChapter = newChapters.first(where: { $0.index == start.chapterIndex }) else {
+              !newChapters.isEmpty else {
             return nil
         }
         let oldLength = (oldChapter.content as NSString).length
         let clampedOffset = min(max(0, contentOffset), oldLength)
-        let newLength = (newChapter.content as NSString).length
-        return ChapterPosition(
-            chapterIndex: start.chapterIndex,
-            contentOffset: min(start.contentOffset + clampedOffset, newLength)
-        )
+        if let start = contentStarts[chapterIndex],
+           let newChapter = newChapters.first(where: { $0.index == start.chapterIndex }) {
+            let newLength = (newChapter.content as NSString).length
+            return ChapterPosition(
+                chapterIndex: start.chapterIndex,
+                contentOffset: min(start.contentOffset + clampedOffset, newLength)
+            )
+        }
+
+        // 旧版将整本书存成一章时，新目录的多段正文会出现在同一旧章节中。
+        let oldContent = oldChapter.content as NSString
+        var searchOffset = 0
+        var lastPosition: ChapterPosition?
+        for newChapter in newChapters {
+            guard !newChapter.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  searchOffset <= oldLength else { continue }
+            let match = oldContent.range(
+                of: newChapter.content,
+                range: NSRange(location: searchOffset, length: oldLength - searchOffset)
+            )
+            guard match.location != NSNotFound else { continue }
+            if clampedOffset < match.location {
+                return ChapterPosition(chapterIndex: newChapter.index, contentOffset: 0)
+            }
+            if clampedOffset < match.location + match.length {
+                return ChapterPosition(
+                    chapterIndex: newChapter.index,
+                    contentOffset: clampedOffset - match.location
+                )
+            }
+            lastPosition = ChapterPosition(
+                chapterIndex: newChapter.index,
+                contentOffset: match.length
+            )
+            searchOffset = match.location + match.length
+        }
+        return lastPosition
     }
 }

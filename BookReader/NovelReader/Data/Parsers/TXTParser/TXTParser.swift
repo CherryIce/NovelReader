@@ -8,15 +8,23 @@ class TXTParser {
     
     /// 明确的章节标记。括号必须成对，不能把以“一”或数字开头的正文当标题。
     private let explicitChapterPatterns: [String] = [
-        "^第[一二三四五六七八九十百千万零\\d]+章.*$",
+        "^第[零〇一二两三四五六七八九十百千万\\d０-９]+章.*$",
         "^Chapter\\s*\\d+\\b.*$",
         "^(?:（[一二三四五六七八九十\\d]+）|\\([一二三四五六七八九十\\d]+\\)|【[一二三四五六七八九十\\d]+】|\\[[一二三四五六七八九十\\d]+\\])(?:[^。！？；]*)$"
     ]
+    private let supplementalChapterPatterns: [String] = [
+        "^第[零〇一二两三四五六七八九十百千万\\d０-９]+回.*$",
+        "^第[零〇一二两三四五六七八九十百千万\\d０-９]+卷.{0,35}第[零〇一二两三四五六七八九十百千万\\d０-９]+章.*$"
+    ]
     private let numberedChapterPattern = "^([1-9]\\d{0,3})[.．、][ \\t　]*(?!\\d)[^。！？；，,……\\r\\n]{1,40}$"
 
-    private lazy var explicitChapterRegexes: [NSRegularExpression] = explicitChapterPatterns.compactMap {
+    private lazy var explicitChapterRegexes: [NSRegularExpression] = (explicitChapterPatterns + supplementalChapterPatterns).compactMap {
         try? NSRegularExpression(pattern: $0, options: .caseInsensitive)
     }
+    private lazy var supplementalChapterRegexes: [NSRegularExpression] = supplementalChapterPatterns.compactMap {
+        try? NSRegularExpression(pattern: $0, options: .caseInsensitive)
+    }
+    private lazy var volumeChapterRegex = try? NSRegularExpression(pattern: supplementalChapterPatterns[1])
     private lazy var numberedChapterRegex = try? NSRegularExpression(pattern: numberedChapterPattern)
     
     /// 解析TXT文件
@@ -100,7 +108,9 @@ class TXTParser {
     /// 解析章节
     private func parseChapters(from content: String) -> [ParsedChapter] {
         let lines = content.components(separatedBy: .newlines)
-        let titles = chapterTitleIndexes(in: lines)
+        let detectedTitles = chapterTitleIndexes(in: lines)
+        let redundantTitles = redundantTitleIndexes(in: lines, titles: detectedTitles)
+        let titles = detectedTitles.subtracting(redundantTitles)
         var chapters: [ParsedChapter] = []
         var currentChapterTitle = "前言"
         var currentChapterContent: [String] = []
@@ -129,7 +139,7 @@ class TXTParser {
                 currentChapterTitle = trimmedLine
                 currentChapterContent = []
                 hasChapterHeading = true
-            } else {
+            } else if !redundantTitles.contains(lineIndex) {
                 currentChapterContent.append(line)
             }
         }
@@ -183,6 +193,30 @@ class TXTParser {
         return titles
     }
 
+    /// 卷章复合标题后若紧跟同一章的短标题，只保留一个目录项和一份正文。
+    private func redundantTitleIndexes(in lines: [String], titles: Set<Int>) -> Set<Int> {
+        guard let volumeChapterRegex else { return [] }
+        var redundant = Set<Int>()
+        for index in titles where titles.contains(index + 1) {
+            let first = lines[index].trimmingCharacters(in: .whitespaces)
+            let second = lines[index + 1].trimmingCharacters(in: .whitespaces)
+            let firstRange = NSRange(location: 0, length: first.utf16.count)
+            guard volumeChapterRegex.firstMatch(in: first, range: firstRange) != nil,
+                  let chapterPart = chapterPart(in: first),
+                  chapterPart == second.filter({ !$0.isWhitespace }) else { continue }
+            redundant.insert(index + 1)
+        }
+        return redundant
+    }
+
+    private func chapterPart(in title: String) -> String? {
+        guard let range = title.range(
+            of: "第[零〇一二两三四五六七八九十百千万\\d０-９]+章",
+            options: .regularExpression
+        ) else { return nil }
+        return String(title[range.lowerBound...].filter { !$0.isWhitespace })
+    }
+
     private func isExplicitTitle(_ line: String) -> Bool {
         guard (2...50).contains(line.count) else { return false }
         let range = NSRange(location: 0, length: line.utf16.count)
@@ -192,6 +226,14 @@ class TXTParser {
             }
         }
         return false
+    }
+
+    private func isSupplementalTitle(_ line: String) -> Bool {
+        guard (2...50).contains(line.count) else { return false }
+        let range = NSRange(location: 0, length: line.utf16.count)
+        return supplementalChapterRegexes.contains {
+            $0.firstMatch(in: line, range: range) != nil
+        }
     }
 
     private func numberedTitleNumber(_ line: String) -> Int? {
@@ -204,6 +246,14 @@ class TXTParser {
 
     /// 已保存目录含旧版宽松规则产生的标题时，打开书籍后从原文件重建。
     func needsLegacyRepair(_ chapters: [Chapter]) -> Bool {
+        // 旧规则遗漏的“回”或“卷…章”可能仍藏在已保存的正文中。
+        if chapters.contains(where: { chapter in
+            chapter.content.components(separatedBy: .newlines).contains {
+                isSupplementalTitle($0.trimmingCharacters(in: .whitespaces))
+            }
+        }) {
+            return true
+        }
         let hasExplicitTitle = chapters.contains { isExplicitTitle($0.title) }
         guard hasExplicitTitle else {
             let numberedChapters = chapters.enumerated().filter { index, chapter in

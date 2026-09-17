@@ -451,6 +451,47 @@ struct BookReaderTests {
         #expect(try TXTParser().parse(fileURL: numberedURL).chapters.map(\.title) == ["1. 起点", "2. 终点"])
     }
 
+    @Test func txtParserRecognizesHuiAndMixedChapterHeadings() throws {
+        let fileURL = temporaryFileURL(name: "hui-chapters.txt")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        try "第一回 起因\n第一段正文。\n第二回 经过\n第二段正文。\n第三章 结局\n第三段正文。".write(
+            to: fileURL, atomically: true, encoding: .utf8
+        )
+
+        let chapters = try TXTParser().parse(fileURL: fileURL).chapters
+        #expect(chapters.map(\.title) == ["第一回 起因", "第二回 经过", "第三章 结局"])
+        #expect(chapters.map(\.content) == ["第一段正文。", "第二段正文。", "第三段正文。"])
+    }
+
+    @Test func txtParserRecognizesVolumeChaptersWithoutAdjacentDuplicates() throws {
+        let fileURL = temporaryFileURL(name: "volume-chapters.txt")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        try "第一卷：开端 第一章 初见\n正文甲。\n第一卷：开端 第二章 再会\n第二章 再会\n正文乙。\n第二卷：归程 第一章 结束\n第一章 结束\n正文丙。".write(
+            to: fileURL, atomically: true, encoding: .utf8
+        )
+
+        let chapters = try TXTParser().parse(fileURL: fileURL).chapters
+        #expect(chapters.map(\.title) == [
+            "第一卷：开端 第一章 初见",
+            "第一卷：开端 第二章 再会",
+            "第二卷：归程 第一章 结束"
+        ])
+        #expect(chapters.map(\.content) == ["正文甲。", "正文乙。", "正文丙。"])
+    }
+
+    @Test func txtParserKeepsAdjacentDifferentTitlesWithSameChapterNumber() throws {
+        let fileURL = temporaryFileURL(name: "distinct-adjacent-chapters.txt")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        try "第一卷 第一章 序幕\n第一章 正篇\n正文。".write(
+            to: fileURL, atomically: true, encoding: .utf8
+        )
+
+        let chapters = try TXTParser().parse(fileURL: fileURL).chapters
+        #expect(chapters.map(\.title) == ["第一卷 第一章 序幕", "第一章 正篇"])
+        #expect(chapters[0].content.isEmpty)
+        #expect(chapters[1].content == "正文。")
+    }
+
     @Test func pdfOutlineRangesIgnoreDuplicatesAndInvalidDestinations() {
         let ranges = PDFParser.normalizedPageRanges(
             pageIndices: [4, 2, 2, -1, 99, 1],
@@ -1289,6 +1330,95 @@ struct BookReaderTests {
         #expect(loadedAgain.1.map(\.id) == chapters.map(\.id))
         #expect(loadedAgain.0.lastReadChapterIndex == 1)
         #expect(loadedAgain.0.lastReadContentOffset == bodyStart + 2)
+    }
+
+    @Test func loadBookUseCaseRepairsSinglePrefaceSplitIntoHuiChapters() async throws {
+        let fileURL = temporaryFileURL(name: "legacy-hui-chapters.txt")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let source = "第一回 起因\n第一段正文写在这里。\n第二回 经过\n第二段正文写在这里。\n第三回 结局\n第三段正文写在这里。"
+        try source.write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let persistence = PersistenceController(inMemory: true)
+        let books = BookRepository(context: persistence.container.newBackgroundContext())
+        let chapters = ChapterRepository(context: persistence.container.newBackgroundContext())
+        let bookmarks = BookmarkRepository(context: persistence.container.newBackgroundContext())
+        let oldContent = source as NSString
+        let progressOffset = oldContent.range(of: "第二段正文").location + 2
+        let bookmarkOffset = oldContent.range(of: "第三段正文").location + 3
+        let book = Book(
+            title: "回目旧书",
+            filePath: fileURL.path,
+            format: .txt,
+            lastReadChapterIndex: 0,
+            lastReadContentOffset: progressOffset
+        )
+        _ = try await publisherValue(books.addBook(book, chapters: [
+            Chapter(index: 0, title: "前言", content: source)
+        ]))
+        _ = try await publisherValue(bookmarks.addBookmark(
+            Bookmark(bookId: book.id, chapterIndex: 0, location: bookmarkOffset)
+        ))
+
+        let loaded = try await publisherValue(
+            LoadBookUseCase(
+                bookRepository: books,
+                chapterRepository: chapters,
+                parser: FormatAwareBookParser()
+            ).execute(bookId: book.id, fileURL: fileURL)
+        )
+        #expect(loaded.1.map(\.title) == ["第一回 起因", "第二回 经过", "第三回 结局"])
+        #expect(loaded.0.lastReadChapterIndex == 1)
+        #expect(loaded.0.lastReadContentOffset == 2)
+        let bookmark = try #require(
+            try await publisherValue(bookmarks.getBookmarks(forBookId: book.id)).first
+        )
+        #expect(bookmark.chapterIndex == 2)
+        #expect(bookmark.location == 3)
+        #expect(!TXTParser().needsLegacyRepair(loaded.1))
+    }
+
+    @Test func loadBookUseCaseRepairsVolumeChapterPrefaceAndKeepsPositions() async throws {
+        let fileURL = temporaryFileURL(name: "legacy-volume-chapters.txt")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let source = "第一卷：开端 第一章 初见\n第一段正文写在这里。\n第一卷：开端 第二章 再会\n第二章 再会\n第二段正文写在这里。"
+        try source.write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let persistence = PersistenceController(inMemory: true)
+        let books = BookRepository(context: persistence.container.newBackgroundContext())
+        let chapters = ChapterRepository(context: persistence.container.newBackgroundContext())
+        let bookmarks = BookmarkRepository(context: persistence.container.newBackgroundContext())
+        let oldPreface = "第一卷：开端 第一章 初见\n第一段正文写在这里。\n第一卷：开端 第二章 再会"
+        let progressOffset = (oldPreface as NSString).range(of: "第一段正文").location + 2
+        let book = Book(
+            title: "卷章旧书",
+            filePath: fileURL.path,
+            format: .txt,
+            lastReadChapterIndex: 0,
+            lastReadContentOffset: progressOffset
+        )
+        _ = try await publisherValue(books.addBook(book, chapters: [
+            Chapter(index: 0, title: "前言", content: oldPreface),
+            Chapter(index: 1, title: "第二章 再会", content: "第二段正文写在这里。")
+        ]))
+        _ = try await publisherValue(bookmarks.addBookmark(
+            Bookmark(bookId: book.id, chapterIndex: 1, location: 3)
+        ))
+
+        let loaded = try await publisherValue(
+            LoadBookUseCase(
+                bookRepository: books,
+                chapterRepository: chapters,
+                parser: FormatAwareBookParser()
+            ).execute(bookId: book.id, fileURL: fileURL)
+        )
+        #expect(loaded.1.map(\.title) == ["第一卷：开端 第一章 初见", "第一卷：开端 第二章 再会"])
+        #expect(loaded.0.lastReadChapterIndex == 0)
+        #expect(loaded.0.lastReadContentOffset == 2)
+        let bookmark = try #require(
+            try await publisherValue(bookmarks.getBookmarks(forBookId: book.id)).first
+        )
+        #expect(bookmark.chapterIndex == 1)
+        #expect(bookmark.location == 3)
     }
 
     @Test func atomicImportPersistsChaptersAndRejectsDuplicateFilePath() async throws {
