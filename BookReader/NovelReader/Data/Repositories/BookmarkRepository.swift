@@ -153,6 +153,32 @@ class BookmarkRepository: BookmarkRepositoryProtocol {
         }
         .eraseToAnyPublisher()
     }
+
+    func deleteBookmarks(byIds ids: [UUID]) -> AnyPublisher<Void, Error> {
+        Future { promise in
+            self.context.perform {
+                do {
+                    var entities: [BookmarkEntity] = []
+                    for id in Set(ids) {
+                        let request: NSFetchRequest<BookmarkEntity> = BookmarkEntity.fetchRequest()
+                        request.predicate = NSPredicate(format: "id == %@", id as CVarArg)
+                        guard let entity = try self.context.fetch(request).first else {
+                            throw BookError.notFound
+                        }
+                        entities.append(entity)
+                    }
+
+                    entities.forEach { self.context.delete($0) }
+                    try self.context.save()
+                    promise(.success(()))
+                } catch {
+                    self.context.rollback()
+                    promise(.failure(error))
+                }
+            }
+        }
+        .eraseToAnyPublisher()
+    }
     
     func deleteBookmarks(forBookId bookId: UUID) -> AnyPublisher<Void, Error> {
         Future { promise in

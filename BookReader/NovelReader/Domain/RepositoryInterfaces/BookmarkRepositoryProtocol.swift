@@ -20,6 +20,9 @@ protocol BookmarkRepositoryProtocol {
     
     /// 删除书签
     func deleteBookmark(byId id: UUID) -> AnyPublisher<Void, Error>
+
+    /// 一次删除同一段划线及其想法，失败时不保留部分删除结果
+    func deleteBookmarks(byIds ids: [UUID]) -> AnyPublisher<Void, Error>
     
     /// 删除书籍的所有书签
     func deleteBookmarks(forBookId: UUID) -> AnyPublisher<Void, Error>

@@ -38,6 +38,7 @@ class ReaderViewModel: ObservableObject {
     @Published private(set) var isSavingSelection: Bool = false
     @Published var presentedAnnotationKey: ReaderAnnotationKey?
     @Published private(set) var isSavingAnnotationThought: Bool = false
+    @Published private(set) var isDeletingAnnotation: Bool = false
 
     /// pages 数组版本号，每次重分页时递增，用于通知 UIPageViewController 强制刷新
     @Published var pagesVersion: Int = 0
@@ -1113,6 +1114,32 @@ class ReaderViewModel: ObservableObject {
                 },
                 receiveValue: { [weak self] _ in
                     self?.currentBookmarks.removeAll { $0.id == thought.id }
+                    self?.refreshBookmarkState()
+                }
+            )
+            .store(in: &cancellables)
+    }
+
+    func deleteAnnotation(for key: ReaderAnnotationKey) {
+        guard !isDeletingAnnotation,
+              !isSavingAnnotationThought,
+              let group = annotationGroup(for: key) else { return }
+
+        let ids = group.records.map(\.id)
+        let idSet = Set(ids)
+        isDeletingAnnotation = true
+        bookmarkRepository.deleteBookmarks(byIds: ids)
+            .receive(on: DispatchQueue.main)
+            .sink(
+                receiveCompletion: { [weak self] completion in
+                    guard let self else { return }
+                    self.isDeletingAnnotation = false
+                    if case .failure(let error) = completion {
+                        self.presentOperationError(title: "划线删除失败", error: error)
+                    }
+                },
+                receiveValue: { [weak self] _ in
+                    self?.currentBookmarks.removeAll { idSet.contains($0.id) }
                     self?.refreshBookmarkState()
                 }
             )

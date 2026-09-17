@@ -8,6 +8,7 @@ struct ReaderAnnotationDetailView: View {
     @State private var editorContext: ThoughtEditorContext?
     @State private var thoughtPendingDeletion: Bookmark?
     @State private var showDeleteConfirmation = false
+    @State private var showDeleteAnnotationConfirmation = false
 
     var body: some View {
         Group {
@@ -68,6 +69,21 @@ struct ReaderAnnotationDetailView: View {
         } message: {
             Text("删除后无法恢复，但不会删除这段划线。")
         }
+        .confirmationDialog(
+            "删除这段划线？",
+            isPresented: $showDeleteAnnotationConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("删除划线", role: .destructive) {
+                viewModel.deleteAnnotation(for: annotationKey)
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            let thoughtCount = viewModel.annotationGroup(for: annotationKey)?.thoughts.count ?? 0
+            Text(thoughtCount == 0
+                ? "删除后无法恢复。"
+                : "这段划线下的 \(thoughtCount) 条想法也会一起删除，且无法恢复。")
+        }
         .alert(item: $viewModel.bookmarkAlert) { alert in
             Alert(
                 title: Text(alert.title),
@@ -89,6 +105,13 @@ struct ReaderAnnotationDetailView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(16)
                 .background(Color.orange.opacity(0.09), in: RoundedRectangle(cornerRadius: 14))
+
+            Button(role: .destructive) {
+                showDeleteAnnotationConfirmation = true
+            } label: {
+                Label("删除划线", systemImage: "trash")
+            }
+            .disabled(viewModel.isSavingAnnotationThought || viewModel.isDeletingAnnotation)
         }
     }
 
@@ -126,7 +149,7 @@ struct ReaderAnnotationDetailView: View {
                 .padding(.vertical, 10)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(!annotation.canAddThought || viewModel.isSavingAnnotationThought)
+            .disabled(!annotation.canAddThought || viewModel.isSavingAnnotationThought || viewModel.isDeletingAnnotation)
         }
     }
 
@@ -145,14 +168,14 @@ struct ReaderAnnotationDetailView: View {
                     editorContext = ThoughtEditorContext(thought: thought)
                 }
                 .font(.caption)
-                .disabled(viewModel.isSavingAnnotationThought)
+                .disabled(viewModel.isSavingAnnotationThought || viewModel.isDeletingAnnotation)
 
                 Button("删除", role: .destructive) {
                     thoughtPendingDeletion = thought
                     showDeleteConfirmation = true
                 }
                 .font(.caption)
-                .disabled(viewModel.isSavingAnnotationThought)
+                .disabled(viewModel.isSavingAnnotationThought || viewModel.isDeletingAnnotation)
             }
         }
         .padding(14)

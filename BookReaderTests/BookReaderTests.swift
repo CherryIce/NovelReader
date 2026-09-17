@@ -1185,6 +1185,62 @@ struct BookReaderTests {
         #expect(updatedGroup.thoughts.contains { $0.note == "修改后的想法" })
     }
 
+    @Test func deletingAnnotationRemovesItsThoughtsWithoutTouchingOtherMarks() async throws {
+        let persistence = PersistenceController(inMemory: true)
+        let bookRepository = BookRepository(context: persistence.container.newBackgroundContext())
+        let bookmarkRepository = BookmarkRepository(context: persistence.container.newBackgroundContext())
+        let book = Book(title: "删除划线测试", filePath: "/tmp/delete-annotation.txt", format: .txt)
+        let highlight = Bookmark(
+            bookId: book.id,
+            chapterIndex: 0,
+            location: 10,
+            length: 5,
+            type: .highlight,
+            selectedText: "第一段"
+        )
+        let thought = Bookmark(
+            bookId: book.id,
+            chapterIndex: 0,
+            location: 10,
+            length: 5,
+            type: .note,
+            note: "保存在同一段原文下",
+            selectedText: "第一段"
+        )
+        let otherHighlight = Bookmark(
+            bookId: book.id,
+            chapterIndex: 0,
+            location: 30,
+            length: 5,
+            type: .highlight,
+            selectedText: "另一段"
+        )
+
+        _ = try await publisherValue(bookRepository.addBook(book))
+        for record in [highlight, thought, otherHighlight] {
+            _ = try await publisherValue(bookmarkRepository.addBookmark(record))
+        }
+
+        let group = try #require(ReaderAnnotationGroup.groups(from: [highlight, thought]).first)
+        await #expect(throws: BookError.self) {
+            try await publisherValue(bookmarkRepository.deleteBookmarks(byIds: [highlight.id, UUID()]))
+        }
+        let afterFailedDelete = try await publisherValue(
+            bookmarkRepository.getBookmarks(forBookId: book.id)
+        )
+        #expect(Set(afterFailedDelete.map(\.id)) == Set([highlight.id, thought.id, otherHighlight.id]))
+
+        _ = try await publisherValue(
+            bookmarkRepository.deleteBookmarks(byIds: group.records.map(\.id))
+        )
+        let remaining = try await publisherValue(
+            bookmarkRepository.getBookmarks(forBookId: book.id)
+        )
+        #expect(remaining.map(\.id) == [otherHighlight.id])
+        #expect(ReaderAnnotationGroup.groups(from: remaining).map(\.key)
+            == [ReaderAnnotationKey(bookmark: otherHighlight)])
+    }
+
     @Test func completedStatusSurvivesReadingAnEarlierPage() async throws {
         let persistence = PersistenceController(inMemory: true)
         let repository = BookRepository(context: persistence.container.newBackgroundContext())
