@@ -13,6 +13,7 @@ class BookmarkRepository: BookmarkRepositoryProtocol {
     func getAllAnnotations() -> AnyPublisher<[Bookmark], Error> {
         Future { promise in
             self.context.perform {
+                self.context.reset()
                 let request: NSFetchRequest<BookmarkEntity> = BookmarkEntity.fetchRequest()
                 request.predicate = NSPredicate(
                     format: "type == %@ OR type == %@",
@@ -34,6 +35,7 @@ class BookmarkRepository: BookmarkRepositoryProtocol {
     func getBookmarks(forBookId bookId: UUID) -> AnyPublisher<[Bookmark], Error> {
         Future { promise in
             self.context.perform {
+                self.context.reset()
                 let request: NSFetchRequest<BookmarkEntity> = BookmarkEntity.fetchRequest()
                 request.predicate = NSPredicate(format: "book.id == %@", bookId as CVarArg)
                 request.sortDescriptors = [NSSortDescriptor(key: "createdAt", ascending: false)]
@@ -53,6 +55,7 @@ class BookmarkRepository: BookmarkRepositoryProtocol {
     func getBookmarks(forBookId bookId: UUID, type: BookmarkType) -> AnyPublisher<[Bookmark], Error> {
         Future { promise in
             self.context.perform {
+                self.context.reset()
                 let request: NSFetchRequest<BookmarkEntity> = BookmarkEntity.fetchRequest()
                 request.predicate = NSPredicate(
                     format: "book.id == %@ AND type == %@",

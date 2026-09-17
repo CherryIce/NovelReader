@@ -11,6 +11,9 @@ protocol ChapterRepositoryProtocol {
     
     /// 保存章节（批量）
     func saveChapters(_ chapters: [Chapter], forBookId: UUID) -> AnyPublisher<Void, Error>
+
+    /// 重建 TXT 目录，并在同一事务中迁移阅读位置和书签。
+    func rebuildChaptersPreservingPositions(_ chapters: [Chapter], forBookId: UUID) -> AnyPublisher<Book, Error>
     
     /// 删除书籍的所有章节
     func deleteChapters(forBookId: UUID) -> AnyPublisher<Void, Error>

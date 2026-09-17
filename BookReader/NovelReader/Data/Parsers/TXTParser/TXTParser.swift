@@ -6,18 +6,18 @@ class TXTParser {
     /// 最大支持文件大小：50MB
     private let maxFileSize: Int64 = 50 * 1024 * 1024
     
-    /// 章节标题正则表达式模式
-    private let chapterPatterns: [String] = [
-        "^第[一二三四五六七八九十百千万零\\d]+章.*$",  // 第X章
-        "^第[\\d]+章.*$",                              // 第1章
-        "^Chapter\\s*\\d+.*$",                        // Chapter 1
-        "^\\d+[.．、\\s]+.*$",                         // 1. 或 1、
-        "^[（(【\\[]?[\\d一二三四五六七八九十]+[)）】\\]]?.*$"  // （一）或【1】
+    /// 明确的章节标记。括号必须成对，不能把以“一”或数字开头的正文当标题。
+    private let explicitChapterPatterns: [String] = [
+        "^第[一二三四五六七八九十百千万零\\d]+章.*$",
+        "^Chapter\\s*\\d+\\b.*$",
+        "^(?:（[一二三四五六七八九十\\d]+）|\\([一二三四五六七八九十\\d]+\\)|【[一二三四五六七八九十\\d]+】|\\[[一二三四五六七八九十\\d]+\\])(?:[^。！？；]*)$"
     ]
+    private let numberedChapterPattern = "^([1-9]\\d{0,3})[.．、][ \\t　]*(?!\\d)[^。！？；，,……\\r\\n]{1,40}$"
 
-    private lazy var chapterRegexes: [NSRegularExpression] = chapterPatterns.compactMap {
+    private lazy var explicitChapterRegexes: [NSRegularExpression] = explicitChapterPatterns.compactMap {
         try? NSRegularExpression(pattern: $0, options: .caseInsensitive)
     }
+    private lazy var numberedChapterRegex = try? NSRegularExpression(pattern: numberedChapterPattern)
     
     /// 解析TXT文件
     /// - Parameters:
@@ -100,18 +100,20 @@ class TXTParser {
     /// 解析章节
     private func parseChapters(from content: String) -> [ParsedChapter] {
         let lines = content.components(separatedBy: .newlines)
+        let titles = chapterTitleIndexes(in: lines)
         var chapters: [ParsedChapter] = []
         var currentChapterTitle = "前言"
         var currentChapterContent: [String] = []
         var currentLocation = 0
+        var hasChapterHeading = false
         
-        for line in lines {
+        for (lineIndex, line) in lines.enumerated() {
             let trimmedLine = line.trimmingCharacters(in: .whitespaces)
             
             // 检查是否是章节标题
-            if isChapterTitle(trimmedLine) {
+            if titles.contains(lineIndex) {
                 // 保存上一章节
-                if !currentChapterContent.isEmpty {
+                if !currentChapterContent.isEmpty || hasChapterHeading {
                     let chapterContent = currentChapterContent.joined(separator: "\n")
                     chapters.append(ParsedChapter(
                         index: chapters.count,
@@ -126,13 +128,14 @@ class TXTParser {
                 // 开始新章节
                 currentChapterTitle = trimmedLine
                 currentChapterContent = []
+                hasChapterHeading = true
             } else {
                 currentChapterContent.append(line)
             }
         }
         
         // 保存最后一章
-        if !currentChapterContent.isEmpty {
+        if !currentChapterContent.isEmpty || hasChapterHeading {
             let chapterContent = currentChapterContent.joined(separator: "\n")
             chapters.append(ParsedChapter(
                 index: chapters.count,
@@ -157,20 +160,76 @@ class TXTParser {
         return chapters
     }
     
-    /// 判断是否为章节标题
-    private func isChapterTitle(_ line: String) -> Bool {
-        // 过滤太短的行
-        guard line.count >= 2 && line.count <= 50 else { return false }
-        
-        // 检查是否匹配任何章节模式
+    /// 先选择整本书使用的标题样式；已有明确章节标记时忽略数字列表。
+    private func chapterTitleIndexes(in lines: [String]) -> Set<Int> {
+        let explicit = Set(lines.indices.filter { isExplicitTitle(lines[$0].trimmingCharacters(in: .whitespaces)) })
+        if !explicit.isEmpty { return explicit }
+
+        let numbered = lines.indices.compactMap { index -> (index: Int, number: Int)? in
+            let line = lines[index].trimmingCharacters(in: .whitespaces)
+            guard let number = numberedTitleNumber(line) else { return nil }
+            return (index, number)
+        }
+
+        var titles = Set<Int>()
+        for (first, second) in zip(numbered, numbered.dropFirst()) {
+            guard second.number == first.number + 1 else { continue }
+            let bodyLength = lines[(first.index + 1)..<second.index]
+                .reduce(0) { $0 + $1.trimmingCharacters(in: .whitespacesAndNewlines).count }
+            guard bodyLength >= 50 else { continue }
+            titles.insert(first.index)
+            titles.insert(second.index)
+        }
+        return titles
+    }
+
+    private func isExplicitTitle(_ line: String) -> Bool {
+        guard (2...50).contains(line.count) else { return false }
         let range = NSRange(location: 0, length: line.utf16.count)
-        for regex in chapterRegexes {
+        for regex in explicitChapterRegexes {
             if regex.firstMatch(in: line, options: [], range: range) != nil {
                 return true
             }
         }
-        
         return false
+    }
+
+    private func numberedTitleNumber(_ line: String) -> Int? {
+        guard (2...50).contains(line.count), let regex = numberedChapterRegex else { return nil }
+        let range = NSRange(location: 0, length: line.utf16.count)
+        guard let match = regex.firstMatch(in: line, range: range),
+              let numberRange = Range(match.range(at: 1), in: line) else { return nil }
+        return Int(line[numberRange])
+    }
+
+    /// 已保存目录含旧版宽松规则产生的标题时，打开书籍后从原文件重建。
+    func needsLegacyRepair(_ chapters: [Chapter]) -> Bool {
+        let hasExplicitTitle = chapters.contains { isExplicitTitle($0.title) }
+        guard hasExplicitTitle else {
+            let numberedChapters = chapters.enumerated().filter { index, chapter in
+                !(index == 0 && (chapter.title == "前言" || chapter.title == "正文"))
+            }
+            guard !numberedChapters.isEmpty else { return false }
+            let numbered = numberedChapters.compactMap { index, chapter -> (index: Int, number: Int)? in
+                guard let number = numberedTitleNumber(chapter.title) else { return nil }
+                return (index, number)
+            }
+            guard numbered.count == numberedChapters.count, numbered.count >= 2 else { return true }
+
+            var accepted = Set<Int>()
+            for (first, second) in zip(numbered, numbered.dropFirst()) {
+                let bodyLength = chapters[first.index].content
+                    .trimmingCharacters(in: .whitespacesAndNewlines).count
+                guard second.number == first.number + 1, bodyLength >= 50 else { continue }
+                accepted.insert(first.index)
+                accepted.insert(second.index)
+            }
+            return accepted.count != numbered.count
+        }
+        return chapters.enumerated().contains { index, chapter in
+            if index == 0 && chapter.title == "前言" { return false }
+            return !isExplicitTitle(chapter.title)
+        }
     }
 }
 

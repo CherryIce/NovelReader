@@ -13,6 +13,7 @@ class ChapterRepository: ChapterRepositoryProtocol {
     func getChapters(forBookId bookId: UUID) -> AnyPublisher<[Chapter], Error> {
         Future { promise in
             self.context.perform {
+                self.context.reset()
                 let request: NSFetchRequest<ChapterEntity> = ChapterEntity.fetchRequest()
                 request.predicate = NSPredicate(format: "book.id == %@", bookId as CVarArg)
                 request.sortDescriptors = [NSSortDescriptor(key: "index", ascending: true)]
@@ -32,6 +33,7 @@ class ChapterRepository: ChapterRepositoryProtocol {
     func getChapter(bookId: UUID, index: Int) -> AnyPublisher<Chapter?, Error> {
         Future { promise in
             self.context.perform {
+                self.context.reset()
                 let request: NSFetchRequest<ChapterEntity> = ChapterEntity.fetchRequest()
                 request.predicate = NSPredicate(
                     format: "book.id == %@ AND index == %d",
@@ -77,6 +79,67 @@ class ChapterRepository: ChapterRepositoryProtocol {
                     try self.context.save()
                     promise(.success(()))
                 } catch {
+                    promise(.failure(error))
+                }
+            }
+        }
+        .eraseToAnyPublisher()
+    }
+
+    func rebuildChaptersPreservingPositions(_ chapters: [Chapter], forBookId bookId: UUID) -> AnyPublisher<Book, Error> {
+        Future { promise in
+            self.context.perform {
+                self.context.reset()
+                let bookRequest: NSFetchRequest<BookEntity> = BookEntity.fetchRequest()
+                bookRequest.predicate = NSPredicate(format: "id == %@", bookId as CVarArg)
+                bookRequest.fetchLimit = 1
+
+                do {
+                    guard let bookEntity = try self.context.fetch(bookRequest).first else {
+                        throw BookError.notFound
+                    }
+                    let oldEntities = (bookEntity.chapters?.allObjects as? [ChapterEntity] ?? [])
+                        .sorted { $0.index < $1.index }
+                    let mapper = ChapterPositionMapper(
+                        oldChapters: oldEntities.map { $0.toChapter() },
+                        newChapters: chapters
+                    )
+                    guard let progress = mapper.map(
+                        chapterIndex: Int(bookEntity.lastReadChapterIndex),
+                        contentOffset: Int(bookEntity.lastReadContentOffset)
+                    ) else {
+                        throw BookError.operationFailed(message: "无法保留阅读进度，原目录未更改")
+                    }
+
+                    let bookmarkRequest: NSFetchRequest<BookmarkEntity> = BookmarkEntity.fetchRequest()
+                    bookmarkRequest.predicate = NSPredicate(format: "book.id == %@", bookId as CVarArg)
+                    let bookmarks = try self.context.fetch(bookmarkRequest)
+                    let mappedBookmarks = try bookmarks.map { bookmark -> (BookmarkEntity, ChapterPosition) in
+                        guard let position = mapper.map(
+                            chapterIndex: Int(bookmark.chapterIndex),
+                            contentOffset: Int(bookmark.location)
+                        ) else {
+                            throw BookError.operationFailed(message: "无法保留书签位置，原目录未更改")
+                        }
+                        return (bookmark, position)
+                    }
+
+                    oldEntities.forEach { self.context.delete($0) }
+                    for chapter in chapters {
+                        let entity = ChapterEntity(context: self.context)
+                        entity.fromChapter(chapter, book: bookEntity)
+                    }
+                    bookEntity.lastReadChapterIndex = Int32(progress.chapterIndex)
+                    bookEntity.lastReadContentOffset = Int32(progress.contentOffset)
+                    for (bookmark, position) in mappedBookmarks {
+                        bookmark.chapterIndex = Int32(position.chapterIndex)
+                        bookmark.location = Int32(position.contentOffset)
+                    }
+
+                    try self.context.save()
+                    promise(.success(bookEntity.toBook()))
+                } catch {
+                    self.context.rollback()
                     promise(.failure(error))
                 }
             }

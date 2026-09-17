@@ -13,6 +13,7 @@ class BookRepository: BookRepositoryProtocol {
     func getAllBooks() -> AnyPublisher<[Book], Error> {
         Future { promise in
             self.context.perform {
+                self.context.reset()
                 let request: NSFetchRequest<BookEntity> = BookEntity.fetchRequest()
                 request.sortDescriptors = [NSSortDescriptor(key: "createdAt", ascending: false)]
                 // 确保从持久化存储重新获取最新数据，避免返回已删除的缓存对象
@@ -21,6 +22,7 @@ class BookRepository: BookRepositoryProtocol {
                 
                 do {
                     let entities = try self.context.fetch(request)
+                    try self.relocateManagedFiles(in: entities)
                     let books = entities.map { $0.toBook() }
                     promise(.success(books))
                 } catch {
@@ -34,12 +36,14 @@ class BookRepository: BookRepositoryProtocol {
     func getBook(byId id: UUID) -> AnyPublisher<Book?, Error> {
         Future { promise in
             self.context.perform {
+                self.context.reset()
                 let request: NSFetchRequest<BookEntity> = BookEntity.fetchRequest()
                 request.predicate = NSPredicate(format: "id == %@", id as CVarArg)
                 request.fetchLimit = 1
                 
                 do {
                     let entity = try self.context.fetch(request).first
+                    if let entity { try self.relocateManagedFiles(in: [entity]) }
                     promise(.success(entity?.toBook()))
                 } catch {
                     promise(.failure(error))
@@ -157,6 +161,7 @@ class BookRepository: BookRepositoryProtocol {
                 
                 do {
                     let entities = try self.context.fetch(request)
+                    try self.relocateManagedFiles(in: entities)
                     let books = entities.map { $0.toBook() }
                     promise(.success(books))
                 } catch {
@@ -176,6 +181,7 @@ class BookRepository: BookRepositoryProtocol {
                 
                 do {
                     let entities = try self.context.fetch(request)
+                    try self.relocateManagedFiles(in: entities)
                     let books = entities.map { $0.toBook() }
                     promise(.success(books))
                 } catch {
@@ -199,6 +205,7 @@ class BookRepository: BookRepositoryProtocol {
                 
                 do {
                     let entities = try self.context.fetch(request)
+                    try self.relocateManagedFiles(in: entities)
                     let books = entities.map { $0.toBook() }
                     promise(.success(books))
                 } catch {
@@ -207,6 +214,19 @@ class BookRepository: BookRepositoryProtocol {
             }
         }
         .eraseToAnyPublisher()
+    }
+
+    private func relocateManagedFiles(in entities: [BookEntity]) throws {
+        var changed = false
+        for entity in entities {
+            guard let storedPath = entity.filePath,
+                  let currentPath = ManagedBookFileLocator.relocatedPath(for: storedPath) else {
+                continue
+            }
+            entity.filePath = currentPath
+            changed = true
+        }
+        if changed { try context.save() }
     }
     
     func updateReadingProgress(
